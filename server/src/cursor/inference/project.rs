@@ -8,7 +8,7 @@ use crate::{
         proto::inference as pb,
     },
     model::{
-        parse_token_count, ContentPart, ModelRequest, ModelSpec, ProjectedContent,
+        parse_token_count, ContentPart, ModelConfig, ModelRequest, ModelSpec, ProjectedContent,
         ProjectedMessage, PromptSpec, ProviderReplayState, Role, ToolCallContent, ToolDefinition,
         ToolResultContent,
     },
@@ -19,6 +19,7 @@ pub(crate) fn project(
     input: &pb::InferenceStreamRequest,
     model_id: &str,
     configured_context_window_tokens: Option<u64>,
+    models: &[ModelConfig],
 ) -> Result<ModelRequest> {
     let mut model = ModelSpec::new(model_id);
     if let Some(config) = &input.model_config {
@@ -67,7 +68,11 @@ pub(crate) fn project(
                 .unwrap_or_else(|| serde_json::json!({}));
             ToolDefinition {
                 name: tool.name.clone(),
-                description: tool.description.clone(),
+                description: subagent_models_task_description(
+                    &tool.name,
+                    &tool.description,
+                    models,
+                ),
                 parameters: parameters.get("jsonSchema").cloned().unwrap_or(parameters),
             }
         })
@@ -191,6 +196,48 @@ pub(crate) fn project(
     })
 }
 
+/// Appends the BYOK model catalog to the Task tool description.
+///
+/// The Cursor client builds its own `Task` description on the RunInference
+/// path, so the server cannot inject a catalog there the way it does while
+/// compiling a Run. Only opaque hashes reach the model, which makes a display
+/// name unusable as a `model` argument. Appending the mapping keeps display
+/// names workable for Task calls.
+fn subagent_models_task_description(
+    name: &str,
+    description: &str,
+    models: &[ModelConfig],
+) -> String {
+    if models.is_empty() || !is_task_tool(name) {
+        return description.to_owned();
+    }
+    let mut models = models.iter().collect::<Vec<_>>();
+    models.sort_by(|left, right| {
+        left.display_name
+            .cmp(&right.display_name)
+            .then_with(|| left.model_hash.cmp(&right.model_hash))
+    });
+    let mut description = description.to_owned();
+    description.push_str(
+        "\n\nAdditional available subagent models (BYOK)\n\n\
+         These configured models are also available for explicit model requests. \
+         Pass the exact hash or the display name shown below as model; \
+         the server resolves both to the same model.\n",
+    );
+    for model in models {
+        description.push_str(&format!(
+            "\n- {}: model=\"{}\"",
+            serde_json::json!(model.display_name),
+            model.model_hash,
+        ));
+    }
+    description
+}
+
+fn is_task_tool(name: &str) -> bool {
+    name.eq_ignore_ascii_case("Task")
+}
+
 pub(crate) fn requested_context_window(
     requested: Option<&pb::InferenceRequestedModel>,
 ) -> Result<Option<u64>> {
@@ -277,10 +324,10 @@ mod tests {
             messages: vec![text(4, "You are an assistant"), text(1, "First question")],
             ..Default::default()
         };
-        let first = project(&input, "test-model", None).unwrap();
+        let first = project(&input, "test-model", None, &[]).unwrap();
         input.messages.push(text(2, "First answer"));
         input.messages.push(text(1, "Second question"));
-        let second = project(&input, "test-model", None).unwrap();
+        let second = project(&input, "test-model", None, &[]).unwrap();
 
         assert_eq!(first.prompt.instructions, second.prompt.instructions);
         assert_eq!(first.history, second.history[..first.history.len()]);
@@ -316,7 +363,7 @@ mod tests {
             ..Default::default()
         };
 
-        let request = project(&input, "test-model", None).unwrap();
+        let request = project(&input, "test-model", None, &[]).unwrap();
         assert_eq!(
             request.prompt.tools[0].parameters,
             serde_json::json!({"type":"object"})
@@ -354,7 +401,7 @@ mod tests {
             ..Default::default()
         };
 
-        let request = project(&input, "test-model", None).unwrap();
+        let request = project(&input, "test-model", None, &[]).unwrap();
         let params = &request.prompt.tools[0].parameters;
 
         // Verify that minItems is an integer, not a float
@@ -375,6 +422,7 @@ mod tests {
             },
             "test-model",
             Some(100_000),
+            &[],
         )
         .unwrap();
         assert_eq!(request.model.context_window_tokens, Some(200_000));
@@ -386,6 +434,7 @@ mod tests {
             &pb::InferenceStreamRequest::default(),
             "test-model",
             Some(128_000),
+            &[],
         )
         .unwrap();
         assert_eq!(request.model.context_window_tokens, Some(128_000));
@@ -400,6 +449,7 @@ mod tests {
             },
             "test-model",
             Some(128_000),
+            &[],
         )
         .unwrap_err();
         assert!(error
@@ -423,5 +473,94 @@ mod tests {
             content: Some(pb::inference_core_message::Content::Text(content.into())),
             ..Default::default()
         }
+    }
+
+    fn byok(hash: &str, display_name: &str) -> ModelConfig {
+        ModelConfig {
+            model_hash: hash.into(),
+            sort_order: 0,
+            display_name: display_name.into(),
+            group_name: None,
+            model_type: crate::model::ModelType::OpenAi,
+            base_url: "http://127.0.0.1:15721".into(),
+            use_full_url: false,
+            api_key: "PROXY_MANAGED".into(),
+            tooltip_data: "0.11x".into(),
+            model_id: "ttsw-codex-test".into(),
+            reasoning_effort: None,
+            openai_endpoint: "/v1/responses".into(),
+            openai_extra_params_enabled: false,
+            openai_extra_params: serde_json::json!({}),
+            custom_headers_enabled: false,
+            custom_headers: serde_json::json!({}),
+            anthropic_extra_params_enabled: false,
+            anthropic_extra_params: serde_json::json!({}),
+            context_window_tokens: None,
+            max_completion_tokens: None,
+            anthropic_max_tokens: None,
+            anthropic_thinking_effort: None,
+            thinking_budget_tokens: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        }
+    }
+
+    fn task_tool(description: &str) -> pb::InferenceAgentTool {
+        pb::InferenceAgentTool {
+            name: "Task".into(),
+            description: description.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn task_description_lists_byok_display_names_with_hashes() {
+        let models = [
+            byok("8c1030decdf858d7", "Deepseek V4.1 Flash (TT Switch)"),
+            byok("0b9f3dcf3d1bcef5", "Claude 5.5 Sonnet (TT Switch)"),
+        ];
+        let input = pb::InferenceStreamRequest {
+            tools: vec![task_tool("Spawn a subagent.")],
+            ..Default::default()
+        };
+        let request = project(&input, "test-model", None, &models).unwrap();
+        let description = &request.prompt.tools[0].description;
+        assert!(description.starts_with("Spawn a subagent."));
+        assert!(description.contains("Additional available subagent models (BYOK)"));
+        // Sorted by display name, so Claude precedes Deepseek.
+        assert!(
+            description.contains("- \"Claude 5.5 Sonnet (TT Switch)\": model=\"0b9f3dcf3d1bcef5\"")
+        );
+        assert!(description
+            .contains("- \"Deepseek V4.1 Flash (TT Switch)\": model=\"8c1030decdf858d7\""));
+        assert!(
+            description.find("Claude 5.5 Sonnet").unwrap()
+                < description.find("Deepseek V4.1 Flash").unwrap()
+        );
+    }
+
+    #[test]
+    fn non_task_tools_keep_their_description() {
+        let models = [byok("0b9f3dcf3d1bcef5", "Claude 5.5 Sonnet (TT Switch)")];
+        let input = pb::InferenceStreamRequest {
+            tools: vec![pb::InferenceAgentTool {
+                name: "Shell".into(),
+                description: "Run a command.".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let request = project(&input, "test-model", None, &models).unwrap();
+        assert_eq!(request.prompt.tools[0].description, "Run a command.");
+    }
+
+    #[test]
+    fn task_description_is_untouched_without_byok_models() {
+        let input = pb::InferenceStreamRequest {
+            tools: vec![task_tool("Spawn a subagent.")],
+            ..Default::default()
+        };
+        let request = project(&input, "test-model", None, &[]).unwrap();
+        assert_eq!(request.prompt.tools[0].description, "Spawn a subagent.");
     }
 }
