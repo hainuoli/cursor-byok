@@ -14,14 +14,19 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     cursor::{
         protocol::{connect, proto::inference as pb},
+        tools::subagent_models::{self, ByokModel},
         transport::{OutputHub, TransportRegistry},
     },
-    model::{ModelInvocation, ModelType, Usage},
+    model::{ModelConfig, ModelInvocation, ModelType, Usage},
     provider::{ModelEvent, Provider},
+    store::Store,
     Error, Result,
 };
 
 use super::project;
+
+/// Cursor's subagent model policies; `none` leaves model selection to the client.
+const SUBAGENT_FORCE_POLICY_NONE: &str = "none";
 
 #[derive(Clone)]
 pub(crate) struct InferenceService {
@@ -46,6 +51,16 @@ struct LocalModel {
     display_name: String,
     model_type: ModelType,
     context_window_tokens: Option<u64>,
+}
+
+struct ServeContext {
+    output: Arc<OutputHub>,
+    provider: Arc<dyn Provider>,
+    store: Store,
+    run_id: String,
+    conversation_id: String,
+    model_id: String,
+    model: Option<LocalModel>,
 }
 
 impl InferenceService {
@@ -97,6 +112,24 @@ impl InferenceService {
             ));
         }
         let configured = self.registry.store().model(model_id).await?;
+        // A Task call may name a BYOK model by display name; resolve it to the
+        // hash so the run is billed and routed to the model the caller meant.
+        let (model_id, configured) = match configured {
+            Some(config) => (model_id.to_string(), Some(config)),
+            None => match self.resolve_by_display_name(model_id).await? {
+                Some(config) => {
+                    tracing::info!(
+                        request_id,
+                        requested = model_id,
+                        resolved = %config.model_hash,
+                        "resolved BYOK subagent model by display name"
+                    );
+                    (config.model_hash.clone(), Some(config))
+                }
+                None => (model_id.to_string(), None),
+            },
+        };
+        let model_id = model_id.as_str();
         let local = configured.is_some() || model_id.starts_with(crate::plugin::ADAPTER_ID_PREFIX);
         let route = if local {
             tracing::info!(
@@ -112,17 +145,20 @@ impl InferenceService {
                 next_seqno: AsyncMutex::new(0),
             });
             tokio::spawn(serve(
+                ServeContext {
+                    output,
+                    provider: self.registry.provider(),
+                    store: self.registry.store().clone(),
+                    run_id: request_id.into(),
+                    conversation_id: request.conversation_id.clone(),
+                    model_id: model_id.into(),
+                    model: configured.map(|model| LocalModel {
+                        display_name: model.display_name,
+                        model_type: model.model_type,
+                        context_window_tokens: model.context_window_tokens,
+                    }),
+                },
                 receiver,
-                output,
-                self.registry.provider(),
-                request_id.into(),
-                request.conversation_id.clone(),
-                model_id.into(),
-                configured.map(|model| LocalModel {
-                    display_name: model.display_name,
-                    model_type: model.model_type,
-                    context_window_tokens: model.context_window_tokens,
-                }),
             ));
             InferenceRoute::Local(run)
         } else {
@@ -145,6 +181,23 @@ impl InferenceService {
 
     pub fn finish(&self, request_id: &str) {
         self.state.lock().remove(request_id);
+    }
+
+    /// Resolves a Task `model` argument that names a model by display name.
+    async fn resolve_by_display_name(&self, requested: &str) -> Result<Option<ModelConfig>> {
+        let models = self.registry.store().models().await?;
+        let byok = models
+            .iter()
+            .map(|model| ByokModel {
+                hash: model.model_hash.clone(),
+                model_id: model.model_id.clone(),
+                display_name: model.display_name.clone(),
+            })
+            .collect::<Vec<_>>();
+        let Ok(hash) = subagent_models::resolve(&byok, requested) else {
+            return Ok(None);
+        };
+        Ok(models.into_iter().find(|model| model.model_hash == hash))
     }
 }
 
@@ -173,21 +226,23 @@ impl Run {
     }
 }
 
-async fn serve(
-    mut input: mpsc::Receiver<pb::RunInferenceClientMessage>,
-    output: Arc<OutputHub>,
-    provider: Arc<dyn Provider>,
-    run_id: String,
-    conversation_id: String,
-    model_id: String,
-    model: Option<LocalModel>,
-) {
+async fn serve(context: ServeContext, mut input: mpsc::Receiver<pb::RunInferenceClientMessage>) {
+    let ServeContext {
+        output,
+        provider,
+        store,
+        run_id,
+        conversation_id,
+        model_id,
+        model,
+    } = context;
     let invocations = Arc::new(Mutex::new(HashMap::<String, CancellationToken>::new()));
     let mut tasks = JoinSet::new();
     let mut finished = false;
     let mut provider_call_index = 0;
     let configured_context_window = model.as_ref().and_then(|model| model.context_window_tokens);
     let mut run_context_window = configured_context_window;
+    let models = store.models().await.unwrap_or_default();
     while let Some(message) = input.recv().await {
         use pb::run_inference_client_message::Message;
         match message.message {
@@ -204,7 +259,7 @@ async fn serve(
                         "inference_context_window_unknown"
                     );
                 }
-                let ready = run_ready(request.requested_model, model.as_ref());
+                let ready = run_ready(request.requested_model, model.as_ref(), &models, &model_id);
                 emit(
                     &output,
                     pb::run_inference_server_message::Message::RunReady(ready),
@@ -224,13 +279,14 @@ async fn serve(
                     );
                     continue;
                 }
-                let request = match project::project(&request, &model_id, run_context_window) {
-                    Ok(request) => request,
-                    Err(error) => {
-                        invocation_error(&output, id, &error.to_string());
-                        continue;
-                    }
-                };
+                let request =
+                    match project::project(&request, &model_id, run_context_window, &models) {
+                        Ok(request) => request,
+                        Err(error) => {
+                            invocation_error(&output, id, &error.to_string());
+                            continue;
+                        }
+                    };
                 let context_window_tokens = request.model.context_window_tokens;
                 let cancellation = CancellationToken::new();
                 invocations.lock().insert(id.clone(), cancellation.clone());
@@ -264,11 +320,17 @@ async fn serve(
                 }
                 break;
             }
+            Some(Message::ResolveSubagentModels(resolve)) => {
+                let resolved = resolve_subagent_models(resolve, &models);
+                emit(
+                    &output,
+                    pb::run_inference_server_message::Message::SubagentModelsResolved(resolved),
+                );
+            }
             Some(
                 Message::ClientHeartbeat(_)
                 | Message::AgentEvent(_)
                 | Message::RunRequestLog(_)
-                | Message::ResolveSubagentModels(_)
                 | Message::ClientFirstCallTimings(_),
             )
             | None => {}
@@ -287,6 +349,8 @@ async fn serve(
 fn run_ready(
     requested_model: Option<pb::InferenceRequestedModel>,
     model: Option<&LocalModel>,
+    models: &[ModelConfig],
+    model_id: &str,
 ) -> pb::RunInferenceRunReady {
     let (display_name, model_type) = model
         .map(|model| (model.display_name.clone(), model.model_type))
@@ -297,7 +361,7 @@ fn run_ready(
     let gpt5 = !anthropic && name.starts_with("gpt-5");
     pb::RunInferenceRunReady {
         resolved_model: requested_model,
-        routed_model_display_name: (!display_name.is_empty()).then_some(display_name),
+        routed_model_display_name: (!display_name.is_empty()).then_some(display_name.clone()),
         prompt_model_metadata: Some(pb::RunInferencePromptModelMetadata {
             vendor: if anthropic { "anthropic" } else { "openai" }.into(),
             prompt_version: "latest".into(),
@@ -312,10 +376,92 @@ fn run_ready(
                 tool_name: "AskQuestion".into(),
                 ..Default::default()
             }),
+            subagent_model_config: Some(subagent_model_config(model_id, models)),
             ..Default::default()
         }),
         accepts_aborted_finish: true,
+        accepts_subagent_model_resolution: true,
         ..Default::default()
+    }
+}
+
+/// Advertises every configured BYOK model as a legal subagent model.
+///
+/// Cursor falls back to pinning subagents to the parent model (`force_policy =
+/// "parent_pin"`) unless the run ships a subagent model catalog, which is why
+/// Task calls collapsed to the parent model. `force_policy = "none"` keeps the
+/// client's own resolution and the catalog is what the Task tool description
+/// and the model argument are resolved against.
+///
+/// `parent_model` must be the model **slug** (`model_hash`), not the display
+/// name: the client uses it as a key into `modelsBySlug`, so a display name
+/// makes the parent model unresolvable and breaks Task calls that do not name
+/// a model explicitly.
+fn subagent_model_config(
+    parent_model: &str,
+    models: &[ModelConfig],
+) -> pb::RunInferenceSubagentModelConfig {
+    pb::RunInferenceSubagentModelConfig {
+        force_policy: SUBAGENT_FORCE_POLICY_NONE.into(),
+        force_model_id: None,
+        parent_max_mode: false,
+        models: models
+            .iter()
+            .map(|model| pb::RunInferenceSubagentModelPolicy {
+                slug: model.model_hash.clone(),
+                advertised: true,
+                valid: true,
+                blocked: false,
+                requires_max_mode: false,
+                representative_cost_dollars: 0.0,
+                legacy_aliases: Vec::new(),
+                turned_off_by_user: false,
+            })
+            .collect(),
+        overrides: Vec::new(),
+        task_tool_omitted: false,
+        parent_requested_model_name: parent_model.into(),
+    }
+}
+
+/// Resolves the model slugs a client asks about before spawning subagents.
+///
+/// Only configured BYOK models can be resolved here; anything else is echoed
+/// back untouched so the client keeps its own upstream resolution.
+fn resolve_subagent_models(
+    resolve: pb::RunInferenceResolveSubagentModels,
+    models: &[ModelConfig],
+) -> pb::RunInferenceSubagentModelsResolved {
+    let byok = models
+        .iter()
+        .map(|model| ByokModel {
+            hash: model.model_hash.clone(),
+            model_id: model.model_id.clone(),
+            display_name: model.display_name.clone(),
+        })
+        .collect::<Vec<_>>();
+    let resolved = resolve
+        .requested_models
+        .iter()
+        .map(|requested| {
+            let hash = if byok.iter().any(|model| &model.hash == requested) {
+                Some(requested.clone())
+            } else {
+                subagent_models::resolve(&byok, requested)
+                    .ok()
+                    .map(str::to_owned)
+                    .filter(|hash| byok.iter().any(|model| &model.hash == hash))
+            };
+            pb::RunInferenceResolvedSubagentModel {
+                requested: requested.clone(),
+                resolved_slug: hash,
+                policy: None,
+            }
+        })
+        .collect();
+    pb::RunInferenceSubagentModelsResolved {
+        resolution_id: resolve.resolution_id,
+        models: resolved,
     }
 }
 
@@ -564,4 +710,207 @@ fn emit(output: &OutputHub, message: pb::run_inference_server_message::Message) 
 
 pub(crate) fn decode_append(data: &[u8]) -> Result<pb::RunInferenceClientMessage> {
     pb::RunInferenceClientMessage::decode(data).map_err(Error::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn byok(hash: &str, model_id: &str, display_name: &str) -> ModelConfig {
+        ModelConfig {
+            model_hash: hash.into(),
+            sort_order: 0,
+            display_name: display_name.into(),
+            group_name: None,
+            model_type: ModelType::OpenAi,
+            base_url: "http://127.0.0.1:15721".into(),
+            use_full_url: false,
+            api_key: "PROXY_MANAGED".into(),
+            tooltip_data: "0.11x".into(),
+            model_id: model_id.into(),
+            reasoning_effort: None,
+            openai_endpoint: "/v1/responses".into(),
+            openai_extra_params_enabled: false,
+            openai_extra_params: serde_json::json!({}),
+            custom_headers_enabled: false,
+            custom_headers: serde_json::json!({}),
+            anthropic_extra_params_enabled: false,
+            anthropic_extra_params: serde_json::json!({}),
+            context_window_tokens: None,
+            max_completion_tokens: None,
+            anthropic_max_tokens: None,
+            anthropic_thinking_effort: None,
+            thinking_budget_tokens: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        }
+    }
+
+    fn request(resolution_id: &str, requested: &[&str]) -> pb::RunInferenceResolveSubagentModels {
+        pb::RunInferenceResolveSubagentModels {
+            resolution_id: resolution_id.into(),
+            requested_models: requested.iter().map(|value| (*value).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn resolves_hashes_ids_and_display_names() {
+        let models = [
+            byok(
+                "8c1030decdf858d7",
+                "ttsw-codex-deepseek-v4.1-flash",
+                "Deepseek V4.1 Flash (TT Switch)",
+            ),
+            byok(
+                "0b9f3dcf3d1bcef5",
+                "ttsw-codex-claude-sonnet-5.5",
+                "Claude 5.5 Sonnet (TT Switch)",
+            ),
+        ];
+        let resolved = resolve_subagent_models(
+            request(
+                "resolution-1",
+                &[
+                    "8c1030decdf858d7",
+                    "ttsw-codex-claude-sonnet-5.5",
+                    "Claude 5.5 Sonnet (TT Switch)",
+                    "Claude 5.5 Sonnet",
+                    "gpt-5.6-sol-medium",
+                ],
+            ),
+            &models,
+        );
+        assert_eq!(resolved.resolution_id, "resolution-1");
+        let slugs = resolved
+            .models
+            .iter()
+            .map(|model| (model.requested.as_str(), model.resolved_slug.as_deref()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            slugs,
+            vec![
+                ("8c1030decdf858d7", Some("8c1030decdf858d7")),
+                ("ttsw-codex-claude-sonnet-5.5", Some("0b9f3dcf3d1bcef5")),
+                ("Claude 5.5 Sonnet (TT Switch)", Some("0b9f3dcf3d1bcef5")),
+                ("Claude 5.5 Sonnet", Some("0b9f3dcf3d1bcef5")),
+                ("gpt-5.6-sol-medium", None),
+            ]
+        );
+    }
+
+    #[test]
+    fn keeps_one_entry_per_requested_model_without_models() {
+        let resolved = resolve_subagent_models(
+            request("resolution-2", &["inherit", "8c1030decdf858d7"]),
+            &[],
+        );
+        assert_eq!(resolved.resolution_id, "resolution-2");
+        assert_eq!(resolved.models.len(), 2);
+        assert!(resolved
+            .models
+            .iter()
+            .all(|model| model.resolved_slug.is_none()));
+    }
+
+    #[test]
+    fn echoes_unknown_frames_with_their_own_resolution_id() {
+        let models = [byok(
+            "0b9f3dcf3d1bcef5",
+            "ttsw-codex-claude-sonnet-5.5",
+            "Claude 5.5 Sonnet (TT Switch)",
+        )];
+        let resolved = resolve_subagent_models(request("", &[]), &models);
+        assert!(resolved.resolution_id.is_empty());
+        assert!(resolved.models.is_empty());
+    }
+
+    #[test]
+    fn run_ready_advertises_every_byok_model_without_pinning() {
+        let models = [
+            byok(
+                "8c1030decdf858d7",
+                "ttsw-codex-deepseek-v4.1-flash",
+                "Deepseek V4.1 Flash (TT Switch)",
+            ),
+            byok(
+                "0b9f3dcf3d1bcef5",
+                "ttsw-codex-claude-sonnet-5.5",
+                "Claude 5.5 Sonnet (TT Switch)",
+            ),
+        ];
+        let local = LocalModel {
+            display_name: "Deepseek V4.1 Flash (TT Switch)".into(),
+            model_type: ModelType::OpenAi,
+            context_window_tokens: None,
+        };
+        let ready = run_ready(None, Some(&local), &models, "8c1030decdf858d7");
+        let config = ready
+            .prompt_model_metadata
+            .expect("prompt metadata is required")
+            .subagent_model_config
+            .expect("subagent model config must be advertised");
+        assert_eq!(config.force_policy, SUBAGENT_FORCE_POLICY_NONE);
+        assert!(config.force_model_id.is_none());
+        assert_eq!(config.parent_requested_model_name, "8c1030decdf858d7");
+        assert!(!config.task_tool_omitted);
+        assert!(
+            config
+                .models
+                .iter()
+                .any(|model| model.slug == config.parent_requested_model_name),
+            "the parent slug must be part of the catalog so unnamed Task calls resolve"
+        );
+        let slugs = config
+            .models
+            .iter()
+            .map(|model| (model.slug.as_str(), model.advertised, model.valid))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            slugs,
+            vec![
+                ("8c1030decdf858d7", true, true),
+                ("0b9f3dcf3d1bcef5", true, true),
+            ]
+        );
+        assert!(config
+            .models
+            .iter()
+            .all(|model| !model.blocked && !model.turned_off_by_user && !model.requires_max_mode));
+    }
+
+    #[test]
+    fn run_ready_still_advertises_an_empty_catalog_without_models() {
+        let local = LocalModel {
+            display_name: "GPT 6.1 Sol (TT Switch)".into(),
+            model_type: ModelType::OpenAi,
+            context_window_tokens: None,
+        };
+        let ready = run_ready(None, Some(&local), &[], "4c3368f26587305a");
+        let config = ready
+            .prompt_model_metadata
+            .expect("prompt metadata is required")
+            .subagent_model_config
+            .expect("config is advertised even with no BYOK models");
+        assert_eq!(config.force_policy, SUBAGENT_FORCE_POLICY_NONE);
+        assert!(config.models.is_empty());
+        assert_eq!(config.parent_requested_model_name, "4c3368f26587305a");
+    }
+
+    #[test]
+    fn subagent_catalog_excludes_display_names_from_parent_lookup() {
+        let models = [byok(
+            "0b9f3dcf3d1bcef5",
+            "ttsw-codex-claude-sonnet-5.5",
+            "Claude 5.5 Sonnet (TT Switch)",
+        )];
+        let config = subagent_model_config("8c1030decdf858d7", &models);
+        assert_eq!(config.parent_requested_model_name, "8c1030decdf858d7");
+        assert!(
+            !config
+                .models
+                .iter()
+                .any(|model| model.slug == "Deepseek V4.1 Flash (TT Switch)"),
+            "display names must never be used as slugs"
+        );
+    }
 }
