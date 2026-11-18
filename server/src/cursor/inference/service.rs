@@ -313,7 +313,7 @@ async fn serve(context: ServeContext, mut input: mpsc::Receiver<pb::RunInference
                         "inference_context_window_unknown"
                     );
                 }
-                let ready = run_ready(request.requested_model, model.as_ref(), &models, &model_id);
+                let ready = run_ready(&request, model.as_ref(), &models, &model_id);
                 emit(
                     &output,
                     pb::run_inference_server_message::Message::RunReady(ready),
@@ -401,7 +401,7 @@ async fn serve(context: ServeContext, mut input: mpsc::Receiver<pb::RunInference
 }
 
 fn run_ready(
-    requested_model: Option<pb::InferenceRequestedModel>,
+    request: &pb::RunInferenceRunRequest,
     model: Option<&LocalModel>,
     models: &[ModelConfig],
     model_id: &str,
@@ -414,7 +414,7 @@ fn run_ready(
     let claude = anthropic && name.contains("claude");
     let gpt5 = !anthropic && name.starts_with("gpt-5");
     pb::RunInferenceRunReady {
-        resolved_model: requested_model,
+        resolved_model: request.requested_model.clone(),
         routed_model_display_name: (!display_name.is_empty()).then_some(display_name.clone()),
         prompt_model_metadata: Some(pb::RunInferencePromptModelMetadata {
             vendor: if anthropic { "anthropic" } else { "openai" }.into(),
@@ -430,7 +430,7 @@ fn run_ready(
                 tool_name: "AskQuestion".into(),
                 ..Default::default()
             }),
-            subagent_model_config: Some(subagent_model_config(model_id, models)),
+            subagent_model_config: Some(subagent_model_config(model_id, models, request)),
             ..Default::default()
         }),
         accepts_aborted_finish: true,
@@ -454,15 +454,47 @@ fn run_ready(
 fn subagent_model_config(
     parent_model: &str,
     models: &[ModelConfig],
+    request: &pb::RunInferenceRunRequest,
 ) -> pb::RunInferenceSubagentModelConfig {
+    use pb::run_inference_subagent_model_override::Selection;
+    let mut seen = std::collections::HashSet::new();
+    let slugs = models
+        .iter()
+        .map(|m| m.model_hash.as_str())
+        .chain(
+            request
+                .selected_subagent_models
+                .iter()
+                .map(|m| m.model_id.as_str()),
+        )
+        .filter(|slug| !slug.is_empty() && *slug != "default" && seen.insert(*slug));
+    let overrides = request
+        .subagent_model_overrides
+        .iter()
+        .filter_map(|entry| {
+            let (kind, model_id) = match entry.selection.as_ref()? {
+                Selection::Model(m) if m.model_id == "default" => ("inherit", None),
+                Selection::Model(m) if !m.model_id.is_empty() => {
+                    ("model", Some(m.model_id.clone()))
+                }
+                Selection::Inherit(true) => ("inherit", None),
+                Selection::Disabled(true) => ("disabled", None),
+                _ => return None,
+            };
+            Some(pb::RunInferenceResolvedSubagentModelOverride {
+                subagent_type: entry.subagent_type.clone(),
+                kind: kind.into(),
+                model_id,
+            })
+        })
+        .collect();
     pb::RunInferenceSubagentModelConfig {
         force_policy: SUBAGENT_FORCE_POLICY_NONE.into(),
         force_model_id: None,
         parent_max_mode: false,
-        models: models
-            .iter()
-            .map(|model| pb::RunInferenceSubagentModelPolicy {
-                slug: model.model_hash.clone(),
+        models: slugs
+            .map(|slug| pb::RunInferenceSubagentModelPolicy {
+                slug: slug.into(),
                 advertised: true,
                 valid: true,
                 blocked: false,
@@ -472,7 +504,7 @@ fn subagent_model_config(
                 turned_off_by_user: false,
             })
             .collect(),
-        overrides: Vec::new(),
+        overrides,
         task_tool_omitted: false,
         parent_requested_model_name: parent_model.into(),
     }
@@ -897,7 +929,12 @@ mod tests {
             model_type: ModelType::OpenAi,
             context_window_tokens: None,
         };
-        let ready = run_ready(None, Some(&local), &models, "8c1030decdf858d7");
+        let ready = run_ready(
+            &Default::default(),
+            Some(&local),
+            &models,
+            "8c1030decdf858d7",
+        );
         let config = ready
             .prompt_model_metadata
             .expect("prompt metadata is required")
@@ -939,7 +976,7 @@ mod tests {
             model_type: ModelType::OpenAi,
             context_window_tokens: None,
         };
-        let ready = run_ready(None, Some(&local), &[], "4c3368f26587305a");
+        let ready = run_ready(&Default::default(), Some(&local), &[], "4c3368f26587305a");
         let config = ready
             .prompt_model_metadata
             .expect("prompt metadata is required")
@@ -957,7 +994,7 @@ mod tests {
             "ttsw-codex-claude-sonnet-5.5",
             "Claude 5.5 Sonnet (TT Switch)",
         )];
-        let config = subagent_model_config("8c1030decdf858d7", &models);
+        let config = subagent_model_config("8c1030decdf858d7", &models, &Default::default());
         assert_eq!(config.parent_requested_model_name, "8c1030decdf858d7");
         assert!(
             !config
