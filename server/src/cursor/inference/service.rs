@@ -45,6 +45,44 @@ pub(crate) struct Run {
     input: mpsc::Sender<pb::RunInferenceClientMessage>,
     output: Arc<OutputHub>,
     next_seqno: AsyncMutex<i64>,
+    subscriptions: Mutex<Subscriptions>,
+}
+
+#[derive(Default)]
+struct Subscriptions {
+    active: usize,
+    generation: u64,
+}
+
+pub(crate) struct Subscription {
+    service: InferenceService,
+    request_id: String,
+    run: Arc<Run>,
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        let mut subscriptions = self.run.subscriptions.lock();
+        subscriptions.active -= 1;
+        if subscriptions.active != 0 {
+            return;
+        }
+        let generation = subscriptions.generation;
+        let state = Arc::downgrade(&self.service.state);
+        let run = Arc::downgrade(&self.run);
+        let request_id = self.request_id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            if let (Some(state), Some(run)) = (state.upgrade(), run.upgrade()) {
+                let mut routes = state.lock();
+                if matches!(routes.get(&request_id), Some(InferenceRoute::Local(current)) if Arc::ptr_eq(current, &run))
+                    && run.subscriptions.lock().generation == generation
+                {
+                    routes.remove(&request_id);
+                }
+            }
+        });
+    }
 }
 
 struct LocalModel {
@@ -143,6 +181,7 @@ impl InferenceService {
                 input: sender,
                 output: output.clone(),
                 next_seqno: AsyncMutex::new(0),
+                subscriptions: Mutex::default(),
             });
             tokio::spawn(serve(
                 ServeContext {
@@ -177,6 +216,25 @@ impl InferenceService {
         drop(state);
         self.changed.notify_waiters();
         Ok(route)
+    }
+
+    pub fn subscribe(
+        &self,
+        request_id: String,
+        run: &Arc<Run>,
+    ) -> (mpsc::UnboundedReceiver<Bytes>, Subscription) {
+        let mut subscriptions = run.subscriptions.lock();
+        subscriptions.active += 1;
+        subscriptions.generation += 1;
+        drop(subscriptions);
+        (
+            run.output.subscribe(),
+            Subscription {
+                service: self.clone(),
+                request_id,
+                run: run.clone(),
+            },
+        )
     }
 
     pub fn finish(&self, request_id: &str) {
@@ -219,10 +277,6 @@ impl Run {
             .map_err(|_| Error::Protocol("RunInference stream has ended".into()))?;
         *next += 1;
         Ok(())
-    }
-
-    pub fn subscribe(&self) -> mpsc::UnboundedReceiver<Bytes> {
-        self.output.subscribe()
     }
 }
 
