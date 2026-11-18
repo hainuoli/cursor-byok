@@ -249,10 +249,9 @@ async fn run_inference_sse_handler(
             .await
         }
         InferenceRoute::Local(run) => {
-            let mut receiver = run.subscribe();
-            let cleanup = InferenceCleanup(inference_service, request_id);
+            let (mut receiver, subscription) = inference_service.subscribe(request_id, &run);
             let stream = async_stream::stream! {
-                let _cleanup = cleanup;
+                let _subscription = subscription;
                 while let Some(frame) = receiver.recv().await {
                     let complete = frame.first().is_some_and(|flag| flag & connect::END_STREAM_FLAG != 0);
                     yield Ok::<Bytes, std::convert::Infallible>(frame);
@@ -274,14 +273,6 @@ async fn run_inference_sse_handler(
                 .insert("connect-protocol-version", HeaderValue::from_static("1"));
             Ok(response)
         }
-    }
-}
-
-struct InferenceCleanup(InferenceService, String);
-
-impl Drop for InferenceCleanup {
-    fn drop(&mut self) {
-        self.0.finish(&self.1);
     }
 }
 
