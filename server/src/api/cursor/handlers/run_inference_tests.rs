@@ -110,6 +110,28 @@ async fn client_loop_receives_ready_text_tool_call_and_completion() {
     assert_eq!(ready.resolved_model.unwrap().model_id, model.model_hash);
     let metadata = ready.prompt_model_metadata.unwrap();
     assert!(!metadata.is_gpt5);
+    drop(stream);
+    let reconnect = Request::post("/aiserver.v1.InferenceService/RunInferenceSSE")
+        .header(header::CONTENT_TYPE, "application/proto")
+        .body(Body::from(
+            connect::encode_message(&agent::BidiRequestId {
+                request_id: request_id.into(),
+            })
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        router.clone().oneshot(reconnect),
+    )
+    .await
+    .expect("reconnect must find the original run")
+    .unwrap();
+    let mut stream = response.into_body().into_data_stream();
+    assert!(matches!(
+        next_message(&mut stream).await.message,
+        Some(pb::run_inference_server_message::Message::RunReady(_))
+    ));
     let modes: Vec<&str> = metadata
         .agent_mode_configs
         .iter()
