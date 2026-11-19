@@ -61,7 +61,7 @@ export function CursorModelCards(props: CursorModelCardsProps) {
         key={group.key}
         label={group.label}
         icon={group.icon}
-        defaultOpen={false}
+        defaultOpen={group.models.length === props.models.length}
         onSettings={props.grouping === "provider" ? () => props.onGroupSettings(group) : undefined}
       >
         {group.models.map((model) => <ModelListRow

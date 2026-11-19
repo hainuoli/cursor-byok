@@ -347,6 +347,87 @@
   }
 }
 
+.batchPanel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  background: var(--vscode-textCodeBlock-background);
+  border: 1px solid var(--vscode-sideBar-border);
+  border-radius: 8px;
+}
+
+.batchHeader {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+
+  strong {
+    color: var(--vscode-foreground);
+    font-size: type.$font-size-xs;
+    font-weight: 600;
+  }
+  span {
+    color: var(--vscode-descriptionForeground);
+    font-size: type.$font-size-2xs;
+  }
+}
+
+.batchToolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--vscode-descriptionForeground);
+  font-size: type.$font-size-2xs;
+}
+
+.batchList {
+  max-height: 220px;
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+  border: 1px solid var(--vscode-sideBar-border);
+  border-radius: 6px;
+}
+
+.batchRow {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+
+  & + & {
+    border-top: 1px solid var(--vscode-sideBar-border);
+  }
+}
+
+.batchId {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--vscode-descriptionForeground);
+  font-size: type.$font-size-2xs;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.batchExisting {
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: 1px 6px;
+  color: var(--vscode-descriptionForeground);
+  border: 1px solid var(--vscode-sideBar-border);
+  border-radius: 999px;
+  font-size: type.$font-size-2xs;
+}
+
+.batchActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 @media (max-width: 720px) {
   .grid {
     grid-template-columns: 1fr;

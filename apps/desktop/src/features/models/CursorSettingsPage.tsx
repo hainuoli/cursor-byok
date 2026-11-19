@@ -3,8 +3,10 @@ import { useNavigate } from "react-router-dom";
 import { api, configuredPluginModels, type Model, type ModelInput } from "../../shared/api";
 import { CursorCaGate, CursorCaProvider, CursorModelGate, CursorModelProvider } from "./CursorGates";
 import { CursorModelCards, cursorModelGroups, type CursorModelGroup, type CursorModelGrouping } from "./CursorModelCards";
+import { type CursorBatchModelOption } from "./CursorModelBatchImport";
 import { CursorModelEditor, emptyCursorModelDraft, type CursorModelDraft } from "./CursorModelEditor";
 import { CursorModelTestResult, type CursorModelTestState } from "./CursorModelTestResult";
+import { modelPresets, presetEndpoint, trimTrailingSlash } from "../../shared/utils/modelPresets";
 import styles from "./CursorSettings.module.scss";
 import { PageContent } from "../../shell/layout/PageContent";
 import { LegacyModelImport } from "./LegacyModelImport";
@@ -27,6 +29,9 @@ export function CursorSettingsPage() {
   const [draft, setDraft] = useState<CursorModelDraft | null>(null);
   const [editing, setEditing] = useState<Model | null>(null);
   const [modelOptions, setModelOptions] = useState<string[]>([]);
+  const [batchOptions, setBatchOptions] = useState<CursorBatchModelOption[]>([]);
+  const [batchSelected, setBatchSelected] = useState<Set<string>>(() => new Set());
+  const [batchBusy, setBatchBusy] = useState(false);
   const [discovering, setDiscovering] = useState(false);
   const [caCommand, setCaCommand] = useState<string | null>(null);
   const [waitingForCaRefresh, setWaitingForCaRefresh] = useState(false);
@@ -53,8 +58,8 @@ export function CursorSettingsPage() {
   ];
   const providerGroups = cursorModelGroups(models, "provider");
   const typeGroups = cursorModelGroups(models, "type");
-  const canGroupByProvider = providerGroups.length > 1;
-  const canGroupByType = typeGroups.length > 1;
+  const canGroupByProvider = models.length > 0;
+  const canGroupByType = models.length > 0;
 
   useEffect(() => {
     if ((grouping === "provider" && !canGroupByProvider) || (grouping === "type" && !canGroupByType)) {
@@ -70,16 +75,22 @@ export function CursorSettingsPage() {
     const status = await appStore.initializeCursorCa();
     if (status?.ca === "untrusted" && status.ca_install_command) setCaCommand(status.ca_install_command);
   };
+  const resetBatch = () => {
+    setBatchOptions([]);
+    setBatchSelected(new Set());
+  };
   const openNew = () => {
     const next = emptyCursorModelDraft();
     next.model.sort_order = models.length + 1;
     setEditing(null);
     setModelOptions([]);
+    resetBatch();
     setDraft(next);
   };
   const openEdit = (model: Model) => {
     setEditing(model);
     setModelOptions([model.model_id]);
+    resetBatch();
     setDraft({
       providerId: `builtin/${model.type}`,
       model: modelInput(model),
@@ -100,7 +111,30 @@ export function CursorSettingsPage() {
         custom_headers_enabled: draft.model.custom_headers_enabled,
         custom_headers,
       });
-      setModelOptions([...new Set(result.models)]);
+      const discovered = [...new Set(result.models)];
+      setModelOptions(discovered);
+      const preset = modelPresets.find((candidate) =>
+        trimTrailingSlash(presetEndpoint(candidate, draft.model.type).baseUrl) === trimTrailingSlash(draft.model.base_url.trim()));
+      const existingKeys = new Set(models.map((model) => `${trimTrailingSlash(model.base_url.trim())}\u0000${model.model_id}`));
+      const baseKey = trimTrailingSlash(draft.model.base_url.trim());
+      const options = discovered.map((modelId): CursorBatchModelOption => {
+        const presetEntry = preset?.models.find((item) => item.model_id === modelId);
+        return {
+          modelId,
+          displayName: presetEntry?.display_name ?? modelId,
+          contextWindowTokens: presetEntry?.context_window_tokens ?? null,
+          maxOutputTokens: presetEntry?.max_output_tokens ?? null,
+          existing: existingKeys.has(`${baseKey}\u0000${modelId}`),
+        };
+      });
+      setBatchOptions(options);
+      setBatchSelected(new Set(options.filter((option) => !option.existing).map((option) => option.modelId)));
+      if (preset && !draft.model.group_name?.trim()) {
+        const presetName = preset.name;
+        setDraft((current) => current && !current.model.group_name?.trim()
+          ? { ...current, model: { ...current.model, group_name: presetName } }
+          : current);
+      }
       return true;
     } catch (cause) {
       message(errorText(cause));
@@ -123,6 +157,46 @@ export function CursorSettingsPage() {
       }
     } catch (cause) {
       message(errorText(cause));
+    }
+  };
+  const importBatch = async () => {
+    if (!draft) return;
+    const chosen = batchOptions.filter((option) => !option.existing && batchSelected.has(option.modelId));
+    if (chosen.length === 0) return;
+    setBatchBusy(true);
+    try {
+      const base = draftInput({
+        ...draft,
+        model: {
+          ...draft.model,
+          display_name: draft.model.display_name.trim() || chosen[0].displayName,
+          tooltip_data: draft.model.tooltip_data.trim() || chosen[0].displayName,
+        },
+      });
+      if (editing && !await appStore.updateCursorModel(editing.model_hash, base)) return;
+      const start = models.length + 1;
+      const created = await appStore.createModels(chosen.map((option, index): ModelInput => ({
+        ...base,
+        model_id: option.modelId,
+        display_name: option.displayName,
+        tooltip_data: option.displayName,
+        context_window_tokens: option.contextWindowTokens ?? base.context_window_tokens,
+        ...(base.type === "openai"
+          ? { max_completion_tokens: option.maxOutputTokens ?? base.max_completion_tokens }
+          : { anthropic_max_tokens: option.maxOutputTokens ?? base.anthropic_max_tokens }),
+        sort_order: start + index,
+      })));
+      if (created && created.length > 0) {
+        message(t("已添加 {count} 个模型", { count: created.length }));
+        resetBatch();
+        setDraft(null);
+        setEditing(null);
+        setGrouping("provider");
+      }
+    } catch (cause) {
+      message(errorText(cause));
+    } finally {
+      setBatchBusy(false);
     }
   };
   const cancelModelTest = async (modelHash: string) => {
@@ -338,9 +412,19 @@ export function CursorSettingsPage() {
     >
       <p>{t("关闭后将移除 Cursor 本地代理配置。如果你需要登陆官方账号，通常不需要关闭操作，推荐直接登陆你的账号即可(byok模型与官方账号的模型已支持无缝衔接)，是否继续关闭并清理代理？")}</p>
     </ConfirmDialog>
-    <Modal fullHeight open={draft !== null} title={editing ? t("编辑模型") : t("添加模型")} banner={draft && (editorTesting || editorTestState) ? <CursorModelTestResult state={editorTestState} testing={editorTesting} /> : undefined} busy={cursorBusy || savingAndTesting} onClose={() => { if (editing && editorTesting) void cancelModelTest(editing.model_hash); setDraft(null); setEditing(null); }} onSubmit={() => void save()} submitLabel={t("保存")} secondaryAction={<button type="button" className={controls.secondary} disabled={cursorBusy || savingAndTesting} onClick={() => void (editorTesting && editing ? cancelModelTest(editing.model_hash) : saveAndTest())}>{savingAndTesting ? t("处理中…") : editorTesting ? t("取消测试") : t("保存并测试")}</button>}>
+    <Modal fullHeight open={draft !== null} title={editing ? t("编辑模型") : t("添加模型")} banner={draft && (editorTesting || editorTestState) ? <CursorModelTestResult state={editorTestState} testing={editorTesting} /> : undefined} busy={cursorBusy || savingAndTesting || batchBusy} onClose={() => { if (editing && editorTesting) void cancelModelTest(editing.model_hash); resetBatch(); setDraft(null); setEditing(null); }} onSubmit={() => void save()} submitLabel={t("保存")} secondaryAction={<button type="button" className={controls.secondary} disabled={cursorBusy || savingAndTesting} onClick={() => void (editorTesting && editing ? cancelModelTest(editing.model_hash) : saveAndTest())}>{savingAndTesting ? t("处理中…") : editorTesting ? t("取消测试") : t("保存并测试")}</button>}>
       {draft && <>
-        <CursorModelEditor draft={draft} modelOptions={modelOptions} discovering={discovering} onChange={setDraft} onDiscover={discover} />
+        <CursorModelEditor
+          draft={draft}
+          modelOptions={modelOptions}
+          discovering={discovering}
+          batch={batchOptions.length > 0 ? { options: batchOptions, selected: batchSelected, busy: batchBusy } : null}
+          onChange={setDraft}
+          onDiscover={discover}
+          onBatchChange={setBatchSelected}
+          onBatchImport={() => void importBatch()}
+          onBatchDismiss={resetBatch}
+        />
       </>}
     </Modal>
     <ConfirmDialog open={caCommand !== null} title={t("安装本地 CA")} cancelLabel={t("关闭")} confirmLabel={t("打开终端")} onCancel={() => setCaCommand(null)} onConfirm={openCaTerminal}>
