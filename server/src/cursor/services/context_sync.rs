@@ -5,7 +5,10 @@ use prost::Message;
 use tokio::sync::{oneshot, Mutex};
 
 use crate::{
-    cursor::{protocol::proto::agent::v1 as pb, transport::TransportHandle},
+    cursor::{
+        protocol::proto::agent::v1 as pb, services::blob_sync::BlobSynchronizer,
+        transport::TransportHandle,
+    },
     store::{BlobId, Store},
     Error, Result,
 };
@@ -16,14 +19,16 @@ type ContextSender = oneshot::Sender<Result<pb::RequestContext>>;
 pub(crate) struct RequestContextSynchronizer {
     handle: TransportHandle,
     store: Store,
+    blob_sync: BlobSynchronizer,
     pending: Arc<Mutex<Option<ContextSender>>>,
 }
 
 impl RequestContextSynchronizer {
-    pub(crate) fn new(handle: TransportHandle, store: Store) -> Self {
+    pub(crate) fn new(handle: TransportHandle, store: Store, blob_sync: BlobSynchronizer) -> Self {
         Self {
             handle,
             store,
+            blob_sync,
             pending: Arc::new(Mutex::new(None)),
         }
     }
@@ -36,9 +41,73 @@ impl RequestContextSynchronizer {
         if !self.has_missing_part(references).await? {
             return Ok(None);
         }
+        // Newer Cursor clients send context as blob *references* only and no
+        // longer answer `RequestContextArgs`. Pull the missing parts over the
+        // KV blob channel first; only fall back to the legacy round trip when
+        // that channel cannot supply them.
+        if self.hydrate_missing_parts(references).await? {
+            return Ok(None);
+        }
         let context = self.load(conversation_id).await?;
         self.cache_parts(&context).await?;
         Ok(Some(context))
+    }
+
+    /// Pulls every referenced-but-absent context part through the KV blob
+    /// channel. Returns `true` when all referenced parts are present afterwards.
+    async fn hydrate_missing_parts(
+        &self,
+        references: &pb::RequestContextPartReferences,
+    ) -> Result<bool> {
+        for (part, raw_id) in self.referenced_parts(references) {
+            if raw_id.is_empty() {
+                continue;
+            }
+            let id = BlobId::from_bytes(raw_id)?;
+            if self.store.get_blob(&id).await?.is_some() {
+                continue;
+            }
+            match self.blob_sync.get(&id).await {
+                Ok(Some(data)) => {
+                    tracing::info!(
+                        request_id = self.handle.request_id(),
+                        part = part,
+                        byte_count = data.len(),
+                        "hydrated Cursor context part over KV blob channel"
+                    );
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        request_id = self.handle.request_id(),
+                        part = part,
+                        "Cursor reported context blob as absent"
+                    );
+                    return Ok(false);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        request_id = self.handle.request_id(),
+                        part = part,
+                        %error,
+                        "Cursor context blob fetch failed"
+                    );
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(!self.has_missing_part(references).await?)
+    }
+
+    fn referenced_parts<'a>(
+        &self,
+        references: &'a pb::RequestContextPartReferences,
+    ) -> [(&'static str, &'a [u8]); 4] {
+        [
+            ("rules", references.rules_blob_id.as_slice()),
+            ("skills", references.skills_blob_id.as_slice()),
+            ("subagents", references.subagents_blob_id.as_slice()),
+            ("mcps", references.mcps_blob_id.as_slice()),
+        ]
     }
 
     pub(crate) async fn get(&self, id: &BlobId) -> Result<Option<Vec<u8>>> {

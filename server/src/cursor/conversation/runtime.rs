@@ -75,8 +75,11 @@ impl ConversationRuntime {
             );
             let mut inbox = OrderedInbox::starting_at(0);
             let tool_runtime_factory = CursorToolRuntime::default();
-            let context_sync =
-                RequestContextSynchronizer::new(handle.clone(), dependencies.store.clone());
+            let context_sync = RequestContextSynchronizer::new(
+                handle.clone(),
+                dependencies.store.clone(),
+                blob_sync.clone(),
+            );
             let mut current = None::<RunGeneration>;
             let mut next_generation = 1_u64;
             let mut pending_finish = None::<(u64, TransportFinish)>;

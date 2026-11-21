@@ -113,8 +113,19 @@ impl HttpHandler for CursorRelay {
         mut request: Request<Body>,
     ) -> RequestOrResponse {
         let original = request.uri().clone();
+        let host = original.host().unwrap_or_default().to_string();
         let locally_routed = should_route_locally(original.path(), *self.tab_mode.read());
-        if is_cursor_host(original.host().unwrap_or_default()) && locally_routed {
+        if is_cursor_host(&host) && !locally_routed && is_streaming_path(original.path()) {
+            // Without this line a missing whitelist entry is invisible: the
+            // request silently reaches the real Cursor backend and the local
+            // transport never sees its downlink.
+            tracing::info!(
+                host = %host,
+                path = original.path(),
+                "proxy forwarding Cursor streaming request to upstream"
+            );
+        }
+        if is_cursor_host(&host) && locally_routed {
             if let Ok(value) = original.to_string().parse() {
                 request.headers_mut().insert(UPSTREAM_URL_HEADER, value);
             }
@@ -154,11 +165,23 @@ pub fn is_cursor_host(host: &str) -> bool {
     matches!(host.as_str(), "api2.cursor.sh" | "api3.cursor.sh") || host.ends_with(".cursor.sh")
 }
 
+/// Streaming/run endpoints whose upstream forwarding deserves a log line.
+fn is_streaming_path(path: &str) -> bool {
+    let cursor_api = path.starts_with("/agent.v1.") || path.starts_with("/aiserver.v1.");
+    cursor_api
+        && (path.contains("Run")
+            || path.contains("Stream")
+            || path.contains("Poll")
+            || path.contains("Bidi"))
+}
+
 fn is_local_path(path: &str) -> bool {
     matches!(
         path,
         "/agent.v1.AgentService/RunSSE"
+            | "/agent.v1.AgentService/RunPoll"
             | "/aiserver.v1.InferenceService/RunInferenceSSE"
+            | "/aiserver.v1.InferenceService/RunInferencePoll"
             | "/aiserver.v1.BidiService/BidiAppend"
             | "/aiserver.v1.AiService/AvailableDocs"
             | "/aiserver.v1.DashboardService/GetEffectiveUserPlugins"
@@ -219,5 +242,22 @@ mod tests {
         ] {
             assert!(is_local_path(path), "{path} must not reach Cursor upstream");
         }
+    }
+
+    #[test]
+    fn poll_transport_downlinks_are_served_locally() {
+        // Cursor 3.24 `http1_poll` pulls BYOK output through these endpoints.
+        // Forwarding them upstream leaves the local transport without a reader
+        // (no KV blob fetch, no model call) while the client waits forever.
+        for path in [
+            "/agent.v1.AgentService/RunPoll",
+            "/aiserver.v1.InferenceService/RunInferencePoll",
+            "/agent.v1.AgentService/RunSSE",
+            "/aiserver.v1.InferenceService/RunInferenceSSE",
+            "/aiserver.v1.BidiService/BidiAppend",
+        ] {
+            assert!(is_local_path(path), "{path} must be served by cursor-byok");
+        }
+        assert!(!is_local_path("/agent.v1.AgentService/Run"));
     }
 }
