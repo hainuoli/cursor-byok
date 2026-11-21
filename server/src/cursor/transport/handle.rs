@@ -114,6 +114,24 @@ impl TransportHandle {
         self.output.subscribe()
     }
 
+    /// Returns the frames a polling client has not received yet.
+    pub fn poll_frames(&self) -> (usize, Vec<Bytes>, bool) {
+        self.output.poll_frames()
+    }
+
+    pub fn advance_poll_cursor(&self, by: usize) {
+        self.output.advance_poll_cursor(by);
+    }
+
+    pub async fn wait_for_output(&self) {
+        self.output.wait_for_output().await;
+    }
+
+    /// Claims the exclusive poll consumer slot for this transport.
+    pub fn try_begin_poll(&self) -> Option<super::PollLease> {
+        self.output.try_begin_poll()
+    }
+
     pub fn emit_frame(&self, frame: Bytes) -> bool {
         self.output.emit(frame)
     }

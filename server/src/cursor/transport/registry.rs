@@ -1,7 +1,7 @@
 //! Maps request IDs to active transport handles.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -33,6 +33,10 @@ struct RegistryInner {
     local: Mutex<HashMap<String, LocalTransport>>,
     next_local_generation: AtomicU64,
     upstream: Mutex<HashMap<String, u64>>,
+    /// Request IDs whose local transport recently closed. A late `RunPoll` for
+    /// one of them must not be forwarded to Cursor upstream: that would mix
+    /// upstream `seqno`s into a BYOK run the client is still re-polling.
+    recent_local: Mutex<VecDeque<String>>,
     route_changed: Notify,
     store: Store,
     traces: CursorTraceService,
@@ -52,6 +56,29 @@ struct LocalTransport {
 pub enum TransportRoute {
     Local,
     Upstream(u64),
+}
+
+impl RegistryInner {
+    const RECENT_LOCAL_LIMIT: usize = 512;
+
+    /// Remembers a local request ID for a short while after its transport
+    /// closes, so a late `RunPoll` returns "run not found" instead of being
+    /// forwarded to Cursor upstream.
+    async fn note_local_closed(&self, request_id: &str) {
+        let mut recent = self.recent_local.lock().await;
+        while recent.len() >= Self::RECENT_LOCAL_LIMIT {
+            recent.pop_front();
+        }
+        recent.push_back(request_id.to_string());
+    }
+
+    async fn was_local(&self, request_id: &str) -> bool {
+        self.recent_local
+            .lock()
+            .await
+            .iter()
+            .any(|id| id == request_id)
+    }
 }
 
 impl TransportRegistry {
@@ -116,6 +143,7 @@ impl TransportRegistry {
                 local: Mutex::new(HashMap::new()),
                 next_local_generation: AtomicU64::new(1),
                 upstream: Mutex::new(HashMap::new()),
+                recent_local: Mutex::new(VecDeque::new()),
                 route_changed: Notify::new(),
                 traces: CursorTraceService::new(store.clone()),
                 conversations: ConversationRegistry::new(
@@ -210,6 +238,7 @@ impl TransportRegistry {
                     .is_some_and(|transport| transport.generation == generation)
                 {
                     local.remove(&request_id);
+                    registry.note_local_closed(&request_id).await;
                 }
             }
         });
@@ -223,6 +252,11 @@ impl TransportRegistry {
             .await
             .get(request_id)
             .map(|transport| transport.handle.clone())
+    }
+
+    /// Whether this request ID belonged to a local run that already finished.
+    pub async fn was_local(&self, request_id: &str) -> bool {
+        self.inner.was_local(request_id).await
     }
 
     pub async fn mark_upstream(&self, request_id: &str) {
