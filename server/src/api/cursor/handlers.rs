@@ -10,7 +10,7 @@ use tower_http::decompression::RequestDecompressionLayer;
 
 use crate::{
     api::cursor::{
-        bidi,
+        bidi, bidi_poll,
         proxy::{self, CursorProxy},
         run_sse,
     },
@@ -49,6 +49,7 @@ fn router_with_proxy(
     Router::new()
         .route("/__byok-api__/healthz", get(health))
         .route("/agent.v1.AgentService/RunSSE", post(run_sse_handler))
+        .route("/agent.v1.AgentService/RunPoll", post(run_poll_handler))
         .route(
             "/aiserver.v1.InferenceService/RunInferenceSSE",
             post(run_inference_sse_handler),
@@ -193,6 +194,154 @@ async fn is_connected() -> Result<Response<Body>> {
         HeaderValue::from_static("application/proto"),
     );
     Ok(response)
+}
+
+async fn run_poll_handler(
+    State(registry): State<TransportRegistry>,
+    Extension(proxy): Extension<CursorProxy>,
+    request: Request<Body>,
+) -> Result<Response<Body>> {
+    // `RunPoll` is a Connect client-stream carrying one `BidiPollRequest`.
+    // Cursor closes the body right after that frame, so reading to EOF is
+    // bounded; frames are parsed while chunks arrive and the raw bytes are kept
+    // so a poll for a non-BYOK model can be replayed upstream verbatim.
+    const MAX_POLL_BODY: usize = 64 * 1024;
+    let (parts, body) = request.into_parts();
+    let mut stream = body.into_data_stream();
+    let mut raw: Vec<u8> = Vec::new();
+    let mut parsed = 0usize;
+    let mut request_id: Option<String> = None;
+    // Kept for logging only: the server does not act on `start_request`.
+    let mut start_request = false;
+    loop {
+        let next = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            tokio_stream::StreamExt::next(&mut stream),
+        )
+        .await;
+        let chunk = match next {
+            Ok(Some(chunk)) => chunk.map_err(|error| {
+                crate::Error::Protocol(format!("cannot read RunPoll body: {error}"))
+            })?,
+            Ok(None) => break,
+            // A truncated body must never be forwarded: the preserved
+            // Content-Length would no longer match what we send upstream.
+            Err(_) => {
+                return Err(crate::Error::Protocol(
+                    "RunPoll body did not finish in time".into(),
+                ))
+            }
+        };
+        if raw.len() + chunk.len() > MAX_POLL_BODY {
+            return Err(crate::Error::Protocol("RunPoll body is too large".into()));
+        }
+        raw.extend_from_slice(&chunk);
+        while raw.len() >= parsed + 5 {
+            let length = u32::from_be_bytes([
+                raw[parsed + 1],
+                raw[parsed + 2],
+                raw[parsed + 3],
+                raw[parsed + 4],
+            ]) as usize;
+            let Some(frame_end) = parsed
+                .checked_add(5)
+                .and_then(|start| start.checked_add(length))
+            else {
+                return Err(crate::Error::Protocol(
+                    "RunPoll frame length overflow".into(),
+                ));
+            };
+            if raw.len() < frame_end {
+                break;
+            }
+            if request_id.is_none() {
+                let payload = &raw[parsed + 5..frame_end];
+                if let Ok(decoded) = <agent::BidiPollRequest as prost::Message>::decode(payload) {
+                    if let Some(id) = decoded
+                        .request_id
+                        .as_ref()
+                        .map(|id| id.request_id.clone())
+                        .filter(|id| !id.is_empty())
+                    {
+                        start_request = decoded.start_request.unwrap_or(false);
+                        request_id = Some(id);
+                    }
+                }
+            }
+            parsed = frame_end;
+        }
+        // Answer a local BYOK poll as soon as its request id is known.
+        if let Some(id) = request_id.as_deref() {
+            if registry.local(id).await.is_some() {
+                break;
+            }
+        }
+    }
+    if let Some(request_id) = &request_id {
+        // A local run that already finished must fail fast instead of waiting
+        // for a route that will never appear and then being forwarded upstream.
+        if registry.local(request_id).await.is_none() && registry.was_local(request_id).await {
+            tracing::warn!(
+                request_id = %request_id,
+                start_request,
+                "RunPoll arrived after its local run finished"
+            );
+            return Err(crate::Error::RunNotFound(request_id.clone()));
+        }
+        // Cursor opens the poll stream before the matching BidiAppend has
+        // necessarily registered a local transport. Forwarding inside that
+        // window hands the client frames from the real Cursor backend starting
+        // at seqno 0; the follow-up poll then replays seqno 0 out of the local
+        // transport and the client fails with "Unexpected seqno: 0 != 1".
+        // Wait for the route the same way RunSSE does.
+        let route = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            registry.wait_route(request_id),
+        )
+        .await;
+        match route {
+            Ok(crate::cursor::transport::TransportRoute::Local) => {
+                tracing::info!(
+                    request_id = %request_id,
+                    start_request,
+                    "RunPoll received for local BYOK run"
+                );
+                return bidi_poll::poll(registry, request_id).await;
+            }
+            Ok(crate::cursor::transport::TransportRoute::Upstream(_)) => {
+                tracing::info!(
+                    request_id = %request_id,
+                    start_request,
+                    "RunPoll received for upstream run; forwarding to Cursor backend"
+                );
+            }
+            Err(_) => {
+                if registry.was_local(request_id).await {
+                    // The local run finished while the client was still
+                    // re-polling. Forwarding would inject upstream seqnos into a
+                    // BYOK conversation, so report the run as gone instead.
+                    tracing::warn!(
+                        request_id = %request_id,
+                        start_request,
+                        "RunPoll arrived after its local run finished"
+                    );
+                    return Err(crate::Error::RunNotFound(request_id.clone()));
+                }
+                tracing::warn!(
+                    request_id = %request_id,
+                    start_request,
+                    "RunPoll has no route after waiting; forwarding to Cursor backend"
+                );
+            }
+        }
+    } else {
+        tracing::warn!("RunPoll carries no request id; forwarding framed body upstream");
+    }
+    proxy::forward(
+        Extension(proxy),
+        Request::from_parts(parts, Body::from(Bytes::from(raw))),
+    )
+    .await
 }
 
 async fn run_sse_handler(
