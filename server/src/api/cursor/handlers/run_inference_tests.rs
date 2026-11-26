@@ -108,7 +108,18 @@ async fn client_loop_receives_ready_text_tool_call_and_completion() {
         panic!("expected run_ready");
     };
     assert_eq!(ready.resolved_model.unwrap().model_id, model.model_hash);
+    assert!(ready.routed_model_display_name.is_none());
     let metadata = ready.prompt_model_metadata.unwrap();
+    assert!(metadata.enable_line_numbers);
+    assert_eq!(
+        metadata
+            .feature_flags
+            .get("dynamicToolProfile")
+            .and_then(|flag| flag.value.as_ref()),
+        Some(&pb::run_inference_flag_value::Value::StringValue(
+            "final".into()
+        ))
+    );
     assert!(!metadata.is_gpt5);
     drop(stream);
     let reconnect = Request::post("/aiserver.v1.InferenceService/RunInferenceSSE")

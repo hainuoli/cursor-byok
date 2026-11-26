@@ -249,6 +249,7 @@ fn context_options(context_window_tokens: Option<u64>) -> Vec<(String, String)> 
 pub async fn available_models(
     State(registry): State<TransportRegistry>,
     Extension(proxy): Extension<CursorProxy>,
+    Extension(catalog): Extension<super::official_catalog::OfficialCatalog>,
     request: Request<Body>,
 ) -> Result<Response<Body>> {
     let models = registry.store().models().await?;
@@ -272,8 +273,25 @@ pub async fn available_models(
         models: available_models,
     }
     .encode_to_vec();
+    let token = super::official_catalog::OfficialCatalog::token_key(request.headers());
+    let byok_hashes = models
+        .iter()
+        .map(|model| model.model_hash.clone())
+        .collect::<std::collections::HashSet<_>>();
     match proxy::forward_buffered(&proxy, request).await {
-        Ok(upstream) => merge_response(upstream, local),
+        Ok(upstream) => {
+            if upstream.status.is_success() {
+                if let Ok((_, payload)) = unary_payload(&upstream.body) {
+                    if let Ok(slugs) = super::official_catalog::slugs_from_available_models_payload(
+                        payload,
+                        &byok_hashes,
+                    ) {
+                        catalog.remember_available_models(token, slugs);
+                    }
+                }
+            }
+            merge_response(upstream, local)
+        }
         Err(error) => {
             tracing::warn!(%error, "Cursor AvailableModels upstream unavailable; using local catalog");
             Ok(local_response(local))

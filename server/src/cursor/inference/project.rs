@@ -224,11 +224,18 @@ fn subagent_models_task_description(
          Pass the exact hash or the display name shown below as model; \
          the server resolves both to the same model.\n",
     );
-    for model in models {
+    let configs: Vec<ModelConfig> = models.into_iter().cloned().collect();
+    let mut byok = crate::cursor::tools::subagent_models::models_from_configs(&configs);
+    crate::cursor::tools::subagent_models::assign_slugs(
+        &mut byok,
+        &std::collections::HashSet::new(),
+    );
+    for model in byok {
         description.push_str(&format!(
-            "\n- {}: model=\"{}\"",
+            "\n- {}: model=\"{}\" (hash=\"{}\")",
             serde_json::json!(model.display_name),
-            model.model_hash,
+            model.advertised_slug,
+            model.hash,
         ));
     }
     description
@@ -528,11 +535,12 @@ mod tests {
         assert!(description.starts_with("Spawn a subagent."));
         assert!(description.contains("Additional available subagent models (BYOK)"));
         // Sorted by display name, so Claude precedes Deepseek.
-        assert!(
-            description.contains("- \"Claude 5.5 Sonnet (TT Switch)\": model=\"0b9f3dcf3d1bcef5\"")
-        );
-        assert!(description
-            .contains("- \"Deepseek V4.1 Flash (TT Switch)\": model=\"8c1030decdf858d7\""));
+        assert!(description.contains(
+            "- \"Claude 5.5 Sonnet (TT Switch)\": model=\"claude-5.5-sonnet-tt-switch\" (hash=\"0b9f3dcf3d1bcef5\")"
+        ));
+        assert!(description.contains(
+            "- \"Deepseek V4.1 Flash (TT Switch)\": model=\"deepseek-v4.1-flash-tt-switch\" (hash=\"8c1030decdf858d7\")"
+        ));
         assert!(
             description.find("Claude 5.5 Sonnet").unwrap()
                 < description.find("Deepseek V4.1 Flash").unwrap()

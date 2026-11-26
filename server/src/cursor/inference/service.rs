@@ -1,6 +1,7 @@
 //! Owns one client-loop inference stream per Cursor request ID.
 use std::{collections::HashMap, sync::Arc};
 
+use axum::http::{header, HeaderMap};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use parking_lot::Mutex;
@@ -12,9 +13,11 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    api::cursor::proxy::CursorProxy,
     cursor::{
         protocol::{connect, proto::inference as pb},
-        tools::subagent_models::{self, ByokModel},
+        services::official_catalog::{OfficialCatalog, OfficialSlug, TokenKey},
+        tools::subagent_models::{self},
         transport::{OutputHub, TransportRegistry},
     },
     model::{ModelConfig, ModelInvocation, ModelType, Usage},
@@ -33,6 +36,8 @@ pub(crate) struct InferenceService {
     state: Arc<Mutex<HashMap<String, InferenceRoute>>>,
     changed: Arc<Notify>,
     registry: TransportRegistry,
+    catalog: OfficialCatalog,
+    proxy: CursorProxy,
 }
 
 #[derive(Clone)]
@@ -99,15 +104,25 @@ struct ServeContext {
     conversation_id: String,
     model_id: String,
     model: Option<LocalModel>,
+    token: TokenKey,
+    headers: HeaderMap,
+    catalog: OfficialCatalog,
+    proxy: CursorProxy,
 }
 
 impl InferenceService {
-    pub fn new(registry: TransportRegistry) -> Self {
+    pub fn new(registry: TransportRegistry, catalog: OfficialCatalog, proxy: CursorProxy) -> Self {
         Self {
             state: Arc::new(Mutex::new(HashMap::new())),
             changed: Arc::new(Notify::new()),
             registry,
+            catalog,
+            proxy,
         }
+    }
+
+    pub fn catalog(&self) -> &OfficialCatalog {
+        &self.catalog
     }
 
     pub fn route(&self, request_id: &str) -> Option<InferenceRoute> {
@@ -130,6 +145,7 @@ impl InferenceService {
         &self,
         request_id: &str,
         message: &pb::RunInferenceClientMessage,
+        headers: &HeaderMap,
     ) -> Result<InferenceRoute> {
         let Some(pb::run_inference_client_message::Message::RunRequest(request)) =
             message.message.as_ref()
@@ -149,12 +165,24 @@ impl InferenceService {
                 "RunInference conversation ID is required".into(),
             ));
         }
+        let token = OfficialCatalog::token_key(headers);
+        let store_models = self.registry.store().models().await?;
+        let byok_hashes = store_models
+            .iter()
+            .map(|model| model.model_hash.clone())
+            .collect::<std::collections::HashSet<_>>();
         let configured = self.registry.store().model(model_id).await?;
-        // A Task call may name a BYOK model by display name; resolve it to the
-        // hash so the run is billed and routed to the model the caller meant.
-        let (model_id, configured) = match configured {
-            Some(config) => (model_id.to_string(), Some(config)),
-            None => match self.resolve_by_display_name(model_id).await? {
+        let (model_id, configured, upstream) = if let Some(config) = configured {
+            (model_id.to_string(), Some(config), false)
+        } else if model_id.starts_with(crate::plugin::ADAPTER_ID_PREFIX) {
+            (model_id.to_string(), None, false)
+        } else {
+            let official = self
+                .catalog
+                .get_or_fetch(token, headers, &self.proxy, &byok_hashes)
+                .await;
+            let reserved = official_reserved(&official);
+            match self.resolve_by_display_name(model_id, &reserved).await? {
                 Some(config) => {
                     tracing::info!(
                         request_id,
@@ -162,13 +190,15 @@ impl InferenceService {
                         resolved = %config.model_hash,
                         "resolved BYOK subagent model by display name"
                     );
-                    (config.model_hash.clone(), Some(config))
+                    (config.model_hash.clone(), Some(config), false)
                 }
-                None => (model_id.to_string(), None),
-            },
+                None => (model_id.to_string(), None, true),
+            }
         };
         let model_id = model_id.as_str();
-        let local = configured.is_some() || model_id.starts_with(crate::plugin::ADAPTER_ID_PREFIX);
+        let local = !upstream
+            && (configured.is_some() || model_id.starts_with(crate::plugin::ADAPTER_ID_PREFIX));
+        let request_headers = capture_request_headers(headers);
         let route = if local {
             tracing::info!(
                 request_id,
@@ -196,6 +226,10 @@ impl InferenceService {
                         model_type: model.model_type,
                         context_window_tokens: model.context_window_tokens,
                     }),
+                    token,
+                    headers: request_headers,
+                    catalog: self.catalog.clone(),
+                    proxy: self.proxy.clone(),
                 },
                 receiver,
             ));
@@ -242,16 +276,14 @@ impl InferenceService {
     }
 
     /// Resolves a Task `model` argument that names a model by display name.
-    async fn resolve_by_display_name(&self, requested: &str) -> Result<Option<ModelConfig>> {
+    async fn resolve_by_display_name(
+        &self,
+        requested: &str,
+        reserved: &std::collections::HashSet<String>,
+    ) -> Result<Option<ModelConfig>> {
         let models = self.registry.store().models().await?;
-        let byok = models
-            .iter()
-            .map(|model| ByokModel {
-                hash: model.model_hash.clone(),
-                model_id: model.model_id.clone(),
-                display_name: model.display_name.clone(),
-            })
-            .collect::<Vec<_>>();
+        let mut byok = subagent_models::models_from_configs(&models);
+        subagent_models::assign_slugs(&mut byok, reserved);
         let Ok(hash) = subagent_models::resolve(&byok, requested) else {
             return Ok(None);
         };
@@ -289,6 +321,10 @@ async fn serve(context: ServeContext, mut input: mpsc::Receiver<pb::RunInference
         conversation_id,
         model_id,
         model,
+        token,
+        headers,
+        catalog,
+        proxy,
     } = context;
     let invocations = Arc::new(Mutex::new(HashMap::<String, CancellationToken>::new()));
     let mut tasks = JoinSet::new();
@@ -313,7 +349,14 @@ async fn serve(context: ServeContext, mut input: mpsc::Receiver<pb::RunInference
                         "inference_context_window_unknown"
                     );
                 }
-                let ready = run_ready(&request, model.as_ref(), &models, &model_id);
+                let byok_hashes = models
+                    .iter()
+                    .map(|model| model.model_hash.clone())
+                    .collect::<std::collections::HashSet<_>>();
+                let official = catalog
+                    .get_or_fetch(token, &headers, &proxy, &byok_hashes)
+                    .await;
+                let ready = run_ready(&request, model.as_ref(), &models, &model_id, &official);
                 emit(
                     &output,
                     pb::run_inference_server_message::Message::RunReady(ready),
@@ -375,7 +418,8 @@ async fn serve(context: ServeContext, mut input: mpsc::Receiver<pb::RunInference
                 break;
             }
             Some(Message::ResolveSubagentModels(resolve)) => {
-                let resolved = resolve_subagent_models(resolve, &models);
+                let official = catalog.get(token);
+                let resolved = resolve_subagent_models(resolve, &models, &official);
                 emit(
                     &output,
                     pb::run_inference_server_message::Message::SubagentModelsResolved(resolved),
@@ -400,11 +444,84 @@ async fn serve(context: ServeContext, mut input: mpsc::Receiver<pb::RunInference
     output.close();
 }
 
+fn official_reserved(official: &[OfficialSlug]) -> std::collections::HashSet<String> {
+    official
+        .iter()
+        .flat_map(|slug| std::iter::once(slug.slug.clone()).chain(slug.legacy_aliases.clone()))
+        .collect()
+}
+
+fn is_official_slug(official: &[OfficialSlug], slug: &str) -> bool {
+    if slug.is_empty() {
+        return false;
+    }
+    official
+        .iter()
+        .any(|model| model.slug == slug || model.legacy_aliases.iter().any(|alias| alias == slug))
+}
+
+fn is_byok_owned_slug(models: &[subagent_models::ByokModel], slug: &str) -> bool {
+    models.iter().any(|model| {
+        model.hash == slug
+            || (!model.advertised_slug.is_empty() && model.advertised_slug == slug)
+            || slug == subagent_models::hash6_slug(&subagent_models::slug_base(model), &model.hash)
+    })
+}
+
+fn capture_request_headers(headers: &HeaderMap) -> HeaderMap {
+    static CONNECT_PROTOCOL_VERSION: axum::http::HeaderName =
+        axum::http::HeaderName::from_static("connect-protocol-version");
+    let mut captured = HeaderMap::new();
+    if let Some(value) = headers.get(header::AUTHORIZATION) {
+        captured.insert(header::AUTHORIZATION, value.clone());
+    }
+    if let Some(value) = headers.get(header::COOKIE) {
+        captured.insert(header::COOKIE, value.clone());
+    }
+    if let Some(value) = headers.get(&CONNECT_PROTOCOL_VERSION) {
+        captured.insert(CONNECT_PROTOCOL_VERSION.clone(), value.clone());
+    }
+    captured
+}
+
+fn local_feature_flags() -> HashMap<String, pb::RunInferenceFlagValue> {
+    use pb::run_inference_flag_value::Value;
+    let mut flags = HashMap::new();
+    let entries: &[(&str, Value)] = &[
+        ("closeStdin", Value::BoolValue(true)),
+        ("disableBackgroundTaskFollowUp", Value::BoolValue(false)),
+        ("enableAwaitForSubagents", Value::BoolValue(true)),
+        ("enableBackgroundTaskProgress", Value::BoolValue(true)),
+        ("enableBoundedSubagentAwait", Value::BoolValue(true)),
+        ("enableDebugSubagent", Value::BoolValue(true)),
+        ("enableEmptyResponseRetry", Value::BoolValue(true)),
+        ("enableExploreSubagent", Value::BoolValue(true)),
+        ("enableReadToolNegativeOffset", Value::BoolValue(true)),
+        ("enableSandboxSharedBuildCache", Value::BoolValue(true)),
+        ("longRunningJobs", Value::BoolValue(true)),
+        ("nalLoopDetection", Value::BoolValue(true)),
+        ("outputNotificationLimit", Value::NumberValue(1000.0)),
+        ("subagentSupportInterrupt", Value::BoolValue(true)),
+        ("useClientSideSubagent", Value::BoolValue(true)),
+        ("dynamicToolProfile", Value::StringValue("final".into())),
+    ];
+    for (name, value) in entries {
+        flags.insert(
+            (*name).into(),
+            pb::RunInferenceFlagValue {
+                value: Some(value.clone()),
+            },
+        );
+    }
+    flags
+}
+
 fn run_ready(
     request: &pb::RunInferenceRunRequest,
     model: Option<&LocalModel>,
     models: &[ModelConfig],
     model_id: &str,
+    official: &[OfficialSlug],
 ) -> pb::RunInferenceRunReady {
     let (display_name, model_type) = model
         .map(|model| (model.display_name.clone(), model.model_type))
@@ -415,7 +532,7 @@ fn run_ready(
     let gpt5 = !anthropic && name.starts_with("gpt-5");
     pb::RunInferenceRunReady {
         resolved_model: request.requested_model.clone(),
-        routed_model_display_name: (!display_name.is_empty()).then_some(display_name.clone()),
+        routed_model_display_name: None,
         prompt_model_metadata: Some(pb::RunInferencePromptModelMetadata {
             vendor: if anthropic { "anthropic" } else { "openai" }.into(),
             prompt_version: "latest".into(),
@@ -425,12 +542,14 @@ fn run_ready(
             is_gpt5: gpt5,
             persona: "auto".into(),
             self_identity_name: "Cursor".into(),
+            enable_line_numbers: true,
             agent_mode_configs: agent_mode_configs(),
             ask_question_config: Some(pb::RunInferenceAskQuestionConfig {
                 tool_name: "AskQuestion".into(),
                 ..Default::default()
             }),
-            subagent_model_config: Some(subagent_model_config(model_id, models, request)),
+            feature_flags: local_feature_flags(),
+            subagent_model_config: Some(subagent_model_config(model_id, models, request, official)),
             ..Default::default()
         }),
         accepts_aborted_finish: true,
@@ -455,19 +574,59 @@ fn subagent_model_config(
     parent_model: &str,
     models: &[ModelConfig],
     request: &pb::RunInferenceRunRequest,
+    official: &[OfficialSlug],
 ) -> pb::RunInferenceSubagentModelConfig {
     use pb::run_inference_subagent_model_override::Selection;
-    let mut seen = std::collections::HashSet::new();
-    let slugs = models
+    let reserved = official_reserved(official);
+    let mut policies = subagent_models::byok_policies(models, &reserved);
+    let existing = policies
         .iter()
-        .map(|m| m.model_hash.as_str())
-        .chain(
-            request
-                .selected_subagent_models
-                .iter()
-                .map(|m| m.model_id.as_str()),
-        )
-        .filter(|slug| !slug.is_empty() && *slug != "default" && seen.insert(*slug));
+        .map(|policy| policy.slug.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let byok_hashes = models
+        .iter()
+        .map(|model| model.model_hash.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    for selected in &request.selected_subagent_models {
+        let slug = selected.model_id.as_str();
+        if slug.is_empty() || slug == "default" {
+            continue;
+        }
+        if byok_hashes.contains(slug) {
+            if let Some(policy) = policies.iter_mut().find(|policy| policy.slug == slug) {
+                policy.advertised = false;
+            }
+            continue;
+        }
+        if existing.contains(slug) {
+            continue;
+        }
+        policies.push(pb::RunInferenceSubagentModelPolicy {
+            slug: slug.into(),
+            advertised: true,
+            valid: true,
+            blocked: false,
+            requires_max_mode: false,
+            representative_cost_dollars: 0.0,
+            legacy_aliases: Vec::new(),
+            turned_off_by_user: false,
+        });
+    }
+    for slug in official {
+        if existing.contains(&slug.slug) || policies.iter().any(|policy| policy.slug == slug.slug) {
+            continue;
+        }
+        policies.push(pb::RunInferenceSubagentModelPolicy {
+            slug: slug.slug.clone(),
+            advertised: slug.advertised,
+            valid: slug.valid,
+            blocked: slug.blocked,
+            requires_max_mode: false,
+            representative_cost_dollars: 0.0,
+            legacy_aliases: slug.legacy_aliases.clone(),
+            turned_off_by_user: false,
+        });
+    }
     let overrides = request
         .subagent_model_overrides
         .iter()
@@ -492,18 +651,7 @@ fn subagent_model_config(
         force_policy: SUBAGENT_FORCE_POLICY_NONE.into(),
         force_model_id: None,
         parent_max_mode: false,
-        models: slugs
-            .map(|slug| pb::RunInferenceSubagentModelPolicy {
-                slug: slug.into(),
-                advertised: true,
-                valid: true,
-                blocked: false,
-                requires_max_mode: false,
-                representative_cost_dollars: 0.0,
-                legacy_aliases: Vec::new(),
-                turned_off_by_user: false,
-            })
-            .collect(),
+        models: policies,
         overrides,
         task_tool_omitted: false,
         parent_requested_model_name: parent_model.into(),
@@ -517,26 +665,27 @@ fn subagent_model_config(
 fn resolve_subagent_models(
     resolve: pb::RunInferenceResolveSubagentModels,
     models: &[ModelConfig],
+    official: &[OfficialSlug],
 ) -> pb::RunInferenceSubagentModelsResolved {
-    let byok = models
-        .iter()
-        .map(|model| ByokModel {
-            hash: model.model_hash.clone(),
-            model_id: model.model_id.clone(),
-            display_name: model.display_name.clone(),
-        })
-        .collect::<Vec<_>>();
+    let mut byok = subagent_models::models_from_configs(models);
+    subagent_models::assign_slugs(&mut byok, &official_reserved(official));
     let resolved = resolve
         .requested_models
         .iter()
         .map(|requested| {
             let hash = if byok.iter().any(|model| &model.hash == requested) {
                 Some(requested.clone())
+            } else if let Some(resolved) = subagent_models::resolve(&byok, requested)
+                .ok()
+                .map(str::to_owned)
+                .filter(|hash| byok.iter().any(|model| &model.hash == hash))
+            {
+                Some(resolved)
+            } else if is_official_slug(official, requested) && !is_byok_owned_slug(&byok, requested)
+            {
+                Some(requested.clone())
             } else {
-                subagent_models::resolve(&byok, requested)
-                    .ok()
-                    .map(str::to_owned)
-                    .filter(|hash| byok.iter().any(|model| &model.hash == hash))
+                None
             };
             pb::RunInferenceResolvedSubagentModel {
                 requested: requested.clone(),
@@ -801,6 +950,21 @@ pub(crate) fn decode_append(data: &[u8]) -> Result<pb::RunInferenceClientMessage
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        api::cursor::proxy::CursorProxy,
+        cursor::{
+            prompting::{PromptAssets, PromptCompiler},
+            transport::TransportRegistry,
+        },
+        model::{ModelConfigInput, OPENAI_CHAT_ENDPOINT},
+        network::NetworkClients,
+        provider::{Provider, ProviderStream},
+        store::Store,
+    };
+    use axum::http::HeaderMap;
+    use futures_util::stream;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
 
     fn byok(hash: &str, model_id: &str, display_name: &str) -> ModelConfig {
         ModelConfig {
@@ -865,6 +1029,7 @@ mod tests {
                 ],
             ),
             &models,
+            &[],
         );
         assert_eq!(resolved.resolution_id, "resolution-1");
         let slugs = resolved
@@ -889,6 +1054,7 @@ mod tests {
         let resolved = resolve_subagent_models(
             request("resolution-2", &["inherit", "8c1030decdf858d7"]),
             &[],
+            &[],
         );
         assert_eq!(resolved.resolution_id, "resolution-2");
         assert_eq!(resolved.models.len(), 2);
@@ -905,9 +1071,29 @@ mod tests {
             "ttsw-codex-claude-sonnet-5.5",
             "Claude 5.5 Sonnet (TT Switch)",
         )];
-        let resolved = resolve_subagent_models(request("", &[]), &models);
+        let resolved = resolve_subagent_models(request("", &[]), &models, &[]);
         assert!(resolved.resolution_id.is_empty());
         assert!(resolved.models.is_empty());
+    }
+
+    #[test]
+    fn resolves_official_slug_when_catalog_contains_it() {
+        let official = [OfficialSlug {
+            slug: "gpt-5.6-sol-medium".into(),
+            advertised: true,
+            valid: true,
+            blocked: false,
+            legacy_aliases: vec![],
+        }];
+        let resolved = resolve_subagent_models(
+            request("resolution-official", &["gpt-5.6-sol-medium"]),
+            &[],
+            &official,
+        );
+        assert_eq!(
+            resolved.models[0].resolved_slug.as_deref(),
+            Some("gpt-5.6-sol-medium")
+        );
     }
 
     #[test]
@@ -934,10 +1120,23 @@ mod tests {
             Some(&local),
             &models,
             "8c1030decdf858d7",
+            &[],
         );
-        let config = ready
+        assert!(ready.routed_model_display_name.is_none());
+        let metadata = ready
             .prompt_model_metadata
-            .expect("prompt metadata is required")
+            .expect("prompt metadata is required");
+        assert!(metadata.enable_line_numbers);
+        assert_eq!(
+            metadata
+                .feature_flags
+                .get("dynamicToolProfile")
+                .and_then(|flag| flag.value.as_ref()),
+            Some(&pb::run_inference_flag_value::Value::StringValue(
+                "final".into()
+            ))
+        );
+        let config = metadata
             .subagent_model_config
             .expect("subagent model config must be advertised");
         assert_eq!(config.force_policy, SUBAGENT_FORCE_POLICY_NONE);
@@ -951,18 +1150,21 @@ mod tests {
                 .any(|model| model.slug == config.parent_requested_model_name),
             "the parent slug must be part of the catalog so unnamed Task calls resolve"
         );
-        let slugs = config
+        let parent_hash = config
             .models
             .iter()
-            .map(|model| (model.slug.as_str(), model.advertised, model.valid))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            slugs,
-            vec![
-                ("8c1030decdf858d7", true, true),
-                ("0b9f3dcf3d1bcef5", true, true),
-            ]
-        );
+            .find(|model| model.slug == config.parent_requested_model_name)
+            .expect("parent hash entry");
+        assert!(!parent_hash.advertised);
+        assert!(parent_hash.valid);
+        let advertised = config
+            .models
+            .iter()
+            .filter(|model| model.advertised)
+            .map(|model| model.slug.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert!(advertised.contains("deepseek-v4.1-flash-tt-switch"));
+        assert!(advertised.contains("claude-5.5-sonnet-tt-switch"));
         assert!(config
             .models
             .iter()
@@ -976,7 +1178,14 @@ mod tests {
             model_type: ModelType::OpenAi,
             context_window_tokens: None,
         };
-        let ready = run_ready(&Default::default(), Some(&local), &[], "4c3368f26587305a");
+        let ready = run_ready(
+            &Default::default(),
+            Some(&local),
+            &[],
+            "4c3368f26587305a",
+            &[],
+        );
+        assert!(ready.routed_model_display_name.is_none());
         let config = ready
             .prompt_model_metadata
             .expect("prompt metadata is required")
@@ -994,7 +1203,7 @@ mod tests {
             "ttsw-codex-claude-sonnet-5.5",
             "Claude 5.5 Sonnet (TT Switch)",
         )];
-        let config = subagent_model_config("8c1030decdf858d7", &models, &Default::default());
+        let config = subagent_model_config("8c1030decdf858d7", &models, &Default::default(), &[]);
         assert_eq!(config.parent_requested_model_name, "8c1030decdf858d7");
         assert!(
             !config
@@ -1003,5 +1212,222 @@ mod tests {
                 .any(|model| model.slug == "Deepseek V4.1 Flash (TT Switch)"),
             "display names must never be used as slugs"
         );
+        assert!(config
+            .models
+            .iter()
+            .any(|model| { model.slug == "claude-5.5-sonnet-tt-switch" && model.advertised }));
+    }
+
+    #[test]
+    fn resolves_hash6_collision_slug_even_when_catalog_lists_it() {
+        let models = [byok(
+            "8c1030decdf858d7",
+            "ttsw-codex-deepseek-v4.1-flash",
+            "Deepseek V4.1 Flash (TT Switch)",
+        )];
+        let official = [OfficialSlug {
+            slug: "deepseek-v4.1-flash-tt-switch-8c1030".into(),
+            advertised: true,
+            valid: true,
+            blocked: false,
+            legacy_aliases: vec![],
+        }];
+        let resolved = resolve_subagent_models(
+            request(
+                "resolution-hash6",
+                &[
+                    "deepseek-v4.1-flash-tt-switch",
+                    "deepseek-v4.1-flash-tt-switch-8c1030",
+                ],
+            ),
+            &models,
+            &official,
+        );
+        assert_eq!(
+            resolved.models[0].resolved_slug.as_deref(),
+            Some("8c1030decdf858d7")
+        );
+        assert_eq!(
+            resolved.models[1].resolved_slug.as_deref(),
+            Some("8c1030decdf858d7")
+        );
+    }
+
+    #[test]
+    fn true_official_collision_keeps_clean_slug_official() {
+        let models = [byok(
+            "8c1030decdf858d7",
+            "ttsw-codex-deepseek-v4.1-flash",
+            "Deepseek V4.1 Flash (TT Switch)",
+        )];
+        let official = [OfficialSlug {
+            slug: "deepseek-v4.1-flash-tt-switch".into(),
+            advertised: true,
+            valid: true,
+            blocked: false,
+            legacy_aliases: vec![],
+        }];
+        let resolved = resolve_subagent_models(
+            request(
+                "resolution-true-collision",
+                &[
+                    "deepseek-v4.1-flash-tt-switch",
+                    "deepseek-v4.1-flash-tt-switch-8c1030",
+                ],
+            ),
+            &models,
+            &official,
+        );
+        assert_eq!(
+            resolved.models[0].resolved_slug.as_deref(),
+            Some("deepseek-v4.1-flash-tt-switch")
+        );
+        assert_eq!(
+            resolved.models[1].resolved_slug.as_deref(),
+            Some("8c1030decdf858d7")
+        );
+    }
+
+    #[derive(Default)]
+    struct SilentProvider;
+
+    impl Provider for SilentProvider {
+        fn stream(
+            &self,
+            _invocation: ModelInvocation,
+            _cancellation: CancellationToken,
+        ) -> ProviderStream {
+            let events: Vec<crate::Result<ModelEvent>> = Vec::new();
+            Box::pin(stream::iter(events))
+        }
+    }
+
+    fn deepseek_input() -> ModelConfigInput {
+        ModelConfigInput {
+            sort_order: 1,
+            display_name: "Deepseek V4.1 Flash (TT Switch)".into(),
+            group_name: None,
+            model_type: ModelType::OpenAi,
+            base_url: "http://127.0.0.1:15721".into(),
+            use_full_url: false,
+            api_key: "PROXY_MANAGED".into(),
+            tooltip_data: "0.11x".into(),
+            model_id: "ttsw-codex-deepseek-v4.1-flash".into(),
+            reasoning_effort: None,
+            openai_endpoint: OPENAI_CHAT_ENDPOINT.into(),
+            openai_extra_params_enabled: false,
+            openai_extra_params: serde_json::json!({}),
+            custom_headers_enabled: false,
+            custom_headers: serde_json::json!({}),
+            anthropic_extra_params_enabled: false,
+            anthropic_extra_params: serde_json::json!({}),
+            context_window_tokens: Some(128_000),
+            max_completion_tokens: None,
+            anthropic_max_tokens: None,
+            anthropic_thinking_effort: None,
+            thinking_budget_tokens: None,
+        }
+    }
+
+    async fn inference_with_deepseek() -> (tempfile::TempDir, TransportRegistry, ModelConfig) {
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", directory.path().join("test.db").display());
+        let store = Store::connect(&url).await.unwrap();
+        let model = store.create_model(&deepseek_input()).await.unwrap();
+        let assets = PromptAssets::load(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("prompt/cursor")
+                .as_path(),
+        )
+        .unwrap();
+        let registry =
+            TransportRegistry::new(store, Arc::new(SilentProvider), PromptCompiler::new(assets));
+        (directory, registry, model)
+    }
+
+    fn run_request(model_id: &str) -> pb::RunInferenceClientMessage {
+        pb::RunInferenceClientMessage {
+            message: Some(pb::run_inference_client_message::Message::RunRequest(
+                pb::RunInferenceRunRequest {
+                    conversation_id: "conversation-hash6".into(),
+                    requested_model: Some(pb::InferenceRequestedModel {
+                        model_id: model_id.into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )),
+        }
+    }
+
+    fn assert_local(route: &InferenceRoute) {
+        assert!(
+            matches!(route, InferenceRoute::Local(_)),
+            "expected BYOK Local route, got Upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn begin_routes_clean_and_hash6_byok_slugs_to_local() {
+        let (_directory, registry, model) = inference_with_deepseek().await;
+        let token = [0u8; 32];
+        let catalog = OfficialCatalog::new();
+        catalog.remember_run_ready(
+            token,
+            vec![
+                OfficialSlug {
+                    slug: "composer-2".into(),
+                    advertised: true,
+                    valid: true,
+                    blocked: false,
+                    legacy_aliases: vec![],
+                },
+                OfficialSlug {
+                    slug: "grok-4.6".into(),
+                    advertised: true,
+                    valid: true,
+                    blocked: false,
+                    legacy_aliases: vec![],
+                },
+            ],
+        );
+        let proxy = CursorProxy::cursor(NetworkClients::new(registry.store().clone()));
+        let service = InferenceService::new(registry.clone(), catalog, proxy);
+
+        let clean = "deepseek-v4.1-flash-tt-switch";
+        let hash6 = format!("{clean}-{}", &model.model_hash[..6]);
+        let headers = HeaderMap::new();
+
+        let clean_route = service
+            .begin("req-clean", &run_request(clean), &headers)
+            .await
+            .unwrap();
+        assert_local(&clean_route);
+
+        let hash6_route = service
+            .begin("req-hash6", &run_request(&hash6), &headers)
+            .await
+            .unwrap();
+        assert_local(&hash6_route);
+
+        let polluted = OfficialCatalog::new();
+        polluted.remember_run_ready(
+            token,
+            vec![OfficialSlug {
+                slug: hash6.clone(),
+                advertised: true,
+                valid: true,
+                blocked: false,
+                legacy_aliases: vec![],
+            }],
+        );
+        assert!(polluted.is_official_slug(token, &hash6));
+        let proxy = CursorProxy::cursor(NetworkClients::new(registry.store().clone()));
+        let polluted_service = InferenceService::new(registry, polluted, proxy);
+        let polluted_route = polluted_service
+            .begin("req-polluted-hash6", &run_request(&hash6), &headers)
+            .await
+            .unwrap();
+        assert_local(&polluted_route);
     }
 }

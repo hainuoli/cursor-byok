@@ -392,14 +392,17 @@ mod tests {
     }
 
     fn context(subagent_model: Option<SubagentModel>) -> ExecContext {
+        let mut byok = vec![ByokModel {
+            hash: "aaaa".into(),
+            model_id: "gpt-x".into(),
+            display_name: "My Model (TT Switch)".into(),
+            advertised_slug: String::new(),
+        }];
+        subagent_models::assign_slugs(&mut byok, &Default::default());
         ExecContext {
             default_subagent_model: "parent-hash".into(),
             subagent_model,
-            byok_models: vec![ByokModel {
-                hash: "aaaa".into(),
-                model_id: "gpt-x".into(),
-                display_name: "My Model (TT Switch)".into(),
-            }],
+            byok_models: byok,
             ..Default::default()
         }
     }
@@ -414,11 +417,14 @@ mod tests {
     #[test]
     fn explicit_byok_model_overrides_cursor_setting() {
         let context = context(Some(SubagentModel::Model("grok-x".into())));
+        let mut byok = context.byok_models.clone();
+        subagent_models::assign_slugs(&mut byok, &Default::default());
+        let advertised = byok[0].advertised_slug.clone();
         for requested in [
             "aaaa",
             "gpt-x",
             "My Model (TT Switch)",
-            "my-model",
+            advertised.as_str(),
             "MY MODEL",
         ] {
             assert_eq!(

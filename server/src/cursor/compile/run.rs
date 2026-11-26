@@ -160,6 +160,7 @@ pub(crate) async fn prepare(
             hash: model.model_hash,
             model_id: model.model_id,
             display_name: model.display_name,
+            advertised_slug: String::new(),
         })
         .collect::<Vec<_>>();
     let mut checkpoint_prompt = compiler.prompt_spec(

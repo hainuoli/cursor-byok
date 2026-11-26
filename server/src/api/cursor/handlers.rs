@@ -6,6 +6,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use futures_util::StreamExt;
 use tower_http::decompression::RequestDecompressionLayer;
 
 use crate::{
@@ -15,14 +16,18 @@ use crate::{
         run_sse,
     },
     cursor::{
-        inference::{decode_append, InferenceRoute, InferenceService},
+        inference::{
+            decode_append,
+            upstream_sse::{prepare_upstream_headers, UpstreamRewrite},
+            InferenceRoute, InferenceService,
+        },
         protocol::{
             connect,
             proto::{agent::v1 as agent, aiserver::v1 as ai, inference},
         },
         services::{
             account, analytics, commit_message, compatibility, entitlement::FreeEntitlementCache,
-            knowledge, model_catalog, server_config, tab,
+            knowledge, model_catalog, official_catalog::OfficialCatalog, server_config, tab,
         },
         transport::{TransportParent, TransportRegistry},
     },
@@ -45,7 +50,9 @@ fn router_with_proxy(
 ) -> Router {
     let web_cache = registry.web_cache().router();
     let free_entitlements = FreeEntitlementCache::default();
-    let inference_service = InferenceService::new(registry.clone());
+    let official_catalog = OfficialCatalog::new();
+    let inference_service =
+        InferenceService::new(registry.clone(), official_catalog.clone(), proxy.clone());
     Router::new()
         .route("/__byok-api__/healthz", get(health))
         .route("/agent.v1.AgentService/RunSSE", post(run_sse_handler))
@@ -170,6 +177,7 @@ fn router_with_proxy(
         .layer(Extension(knowledge_service))
         .layer(Extension(free_entitlements))
         .layer(Extension(inference_service))
+        .layer(Extension(official_catalog))
         .with_state(registry)
         .merge(web_cache)
 }
@@ -233,6 +241,7 @@ async fn run_sse_handler(
 }
 
 async fn run_inference_sse_handler(
+    State(registry): State<TransportRegistry>,
     Extension(inference_service): Extension<InferenceService>,
     Extension(proxy): Extension<CursorProxy>,
     request: Request<Body>,
@@ -242,11 +251,47 @@ async fn run_inference_sse_handler(
     let request_id = request.request_id;
     match inference_service.wait_route(&request_id).await {
         InferenceRoute::Upstream => {
-            proxy::forward(
-                Extension(proxy),
-                Request::from_parts(parts, Body::from(body)),
-            )
-            .await
+            let models = registry.store().models().await?;
+            let reserved = inference_service
+                .catalog()
+                .slug_set(OfficialCatalog::token_key(&parts.headers));
+            let byok = crate::cursor::tools::subagent_models::byok_policies(&models, &reserved);
+            let token = OfficialCatalog::token_key(&parts.headers);
+            let mut request = Request::from_parts(parts, Body::from(body));
+            prepare_upstream_headers(request.headers_mut());
+            let upstream = proxy::forward(Extension(proxy.clone()), request).await?;
+            let status = upstream.status();
+            let headers = upstream.headers().clone();
+            let mut rewrite =
+                UpstreamRewrite::new(byok, inference_service.catalog().clone(), token);
+            let stream = async_stream::stream! {
+                let mut upstream = upstream.into_body().into_data_stream();
+                while let Some(chunk) = upstream.next().await {
+                    match chunk {
+                        Ok(bytes) => {
+                            match rewrite.ingest(bytes.clone()) {
+                                Ok(frames) => {
+                                    for frame in frames {
+                                        yield Ok::<Bytes, std::convert::Infallible>(frame);
+                                    }
+                                }
+                                Err(error) => {
+                                    tracing::warn!(%error, "upstream RunInference rewrite failed");
+                                    yield Ok(bytes);
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(?error, "upstream RunInference stream ended with error");
+                            return;
+                        }
+                    }
+                }
+            };
+            let mut response = Response::new(Body::from_stream(stream));
+            *response.status_mut() = status;
+            *response.headers_mut() = headers;
+            Ok(response)
         }
         InferenceRoute::Local(run) => {
             let (mut receiver, subscription) = inference_service.subscribe(request_id, &run);
@@ -311,7 +356,11 @@ async fn bidi_handler(
             .ok_or_else(|| crate::Error::Protocol("invalid RunInference client message".into()))?;
         let route = match current_route {
             Some(route) => route,
-            None => inference_service.begin(request_id, &message).await?,
+            None => {
+                inference_service
+                    .begin(request_id, &message, &parts.headers)
+                    .await?
+            }
         };
         match route {
             InferenceRoute::Local(run) => {
