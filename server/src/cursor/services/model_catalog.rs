@@ -249,6 +249,7 @@ fn context_options(context_window_tokens: Option<u64>) -> Vec<(String, String)> 
 pub async fn available_models(
     State(registry): State<TransportRegistry>,
     Extension(proxy): Extension<CursorProxy>,
+    Extension(catalog): Extension<super::official_catalog::OfficialCatalog>,
     request: Request<Body>,
 ) -> Result<Response<Body>> {
     let models = registry.store().models().await?;
@@ -272,8 +273,25 @@ pub async fn available_models(
         models: available_models,
     }
     .encode_to_vec();
+    let token = super::official_catalog::OfficialCatalog::token_key(request.headers());
+    let byok_hashes = models
+        .iter()
+        .map(|model| model.model_hash.clone())
+        .collect::<std::collections::HashSet<_>>();
     match proxy::forward_buffered(&proxy, request).await {
-        Ok(upstream) => merge_response(upstream, local),
+        Ok(upstream) => {
+            if upstream.status.is_success() {
+                if let Ok((_, payload)) = unary_payload(&upstream.body) {
+                    if let Ok(slugs) = super::official_catalog::slugs_from_available_models_payload(
+                        &payload,
+                        &byok_hashes,
+                    ) {
+                        catalog.remember_available_models(token, slugs);
+                    }
+                }
+            }
+            merge_response(upstream, local)
+        }
         Err(error) => {
             tracing::warn!(%error, "Cursor AvailableModels upstream unavailable; using local catalog");
             Ok(local_response(local))
@@ -406,17 +424,26 @@ fn merge_response(upstream: proxy::BufferedResponse, extra: Vec<u8>) -> Result<R
         tracing::warn!(status = %upstream.status, "Cursor model catalog upstream rejected request; using local catalog");
         return Ok(local_response(extra));
     }
-    let (framed, payload) = unary_payload(&upstream.body)?;
+    let (framed, payload) = match unary_payload(&upstream.body) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "Cursor model catalog frame unsupported for BYOK merge; failing open with upstream response"
+            );
+            return Ok(upstream.into_response());
+        }
+    };
     let body = if framed {
         let mut merged = BytesMut::with_capacity(5 + payload.len() + extra.len());
         merged.put_u8(0);
         merged.put_u32((payload.len() + extra.len()) as u32);
-        merged.extend_from_slice(payload);
+        merged.extend_from_slice(&payload);
         merged.extend_from_slice(&extra);
         merged.freeze()
     } else {
         let mut merged = BytesMut::with_capacity(payload.len() + extra.len());
-        merged.extend_from_slice(payload);
+        merged.extend_from_slice(&payload);
         merged.extend_from_slice(&extra);
         merged.freeze()
     };
@@ -433,21 +460,26 @@ fn local_response(body: Vec<u8>) -> Response<Body> {
     response
 }
 
-fn unary_payload(body: &Bytes) -> Result<(bool, &[u8])> {
+fn unary_payload(body: &Bytes) -> Result<(bool, std::borrow::Cow<'_, [u8]>)> {
+    use crate::cursor::protocol::connect::{decompress_payload, COMPRESSION_FLAG};
     if body.len() < 5 {
-        return Ok((false, body));
+        return Ok((false, std::borrow::Cow::Borrowed(body)));
     }
     let flags = body[0];
     let length = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
     if length != body.len() - 5 {
-        return Ok((false, body));
+        return Ok((false, std::borrow::Cow::Borrowed(body)));
     }
-    if flags != 0 {
-        return Err(Error::Protocol(format!(
+    match flags {
+        0 => Ok((true, std::borrow::Cow::Borrowed(&body[5..]))),
+        COMPRESSION_FLAG => {
+            let decompressed = decompress_payload(flags, body.slice(5..))?;
+            Ok((true, std::borrow::Cow::Owned(decompressed.to_vec())))
+        }
+        _ => Err(Error::Protocol(format!(
             "cannot merge compressed or terminal model catalog frame: flags={flags}"
-        )));
+        ))),
     }
-    Ok((true, &body[5..]))
 }
 
 fn available_model(model: &ModelConfig) -> AvailableModel {
@@ -858,5 +890,67 @@ mod tests {
             nudge.models_with_no_default_switch,
             vec!["local-model-hash"]
         );
+    }
+
+    use crate::api::cursor::proxy;
+    use crate::cursor::protocol::connect::COMPRESSION_FLAG;
+    use axum::body::Bytes;
+    use bytes::BufMut;
+    use flate2::{write::GzEncoder, Compression};
+    use std::io::Write;
+
+    #[derive(Clone, PartialEq, Message)]
+    struct UpstreamModelsStub {
+        #[prost(string, tag = "1")]
+        model_id: String,
+    }
+
+    fn gzip_connect_body(payload: &[u8]) -> Bytes {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut frame = BytesMut::with_capacity(5 + compressed.len());
+        frame.put_u8(COMPRESSION_FLAG);
+        frame.put_u32(compressed.len() as u32);
+        frame.extend_from_slice(&compressed);
+        frame.freeze()
+    }
+
+    #[tokio::test]
+    async fn merge_response_decompresses_gzip_upstream_and_appends_byok() {
+        let upstream_payload = UpstreamModelsStub {
+            model_id: "official-model".into(),
+        }
+        .encode_to_vec();
+        let upstream = proxy::BufferedResponse {
+            status: StatusCode::OK,
+            headers: Default::default(),
+            body: gzip_connect_body(&upstream_payload),
+        };
+        let local = b"byok-tail".to_vec();
+        let response = merge_response(upstream, local).unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let mut expected = upstream_payload;
+        expected.extend_from_slice(b"byok-tail");
+        assert_eq!(&body[5..], expected);
+    }
+
+    #[tokio::test]
+    async fn merge_response_fails_open_on_unknown_connect_flags() {
+        let upstream_body = Bytes::from(vec![0x04, 0, 0, 0, 2, 0x0a, 0x7b]);
+        let upstream = proxy::BufferedResponse {
+            status: StatusCode::OK,
+            headers: Default::default(),
+            body: upstream_body.clone(),
+        };
+        let response = merge_response(upstream, vec![9, 8, 7]).unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body, upstream_body);
     }
 }

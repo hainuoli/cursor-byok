@@ -231,6 +231,18 @@ impl TransportRegistry {
         upstream.insert(request_id.into(), generation);
         drop(upstream);
         self.inner.route_changed.notify_waiters();
+
+        let inner = Arc::downgrade(&self.inner);
+        let request_id = request_id.to_owned();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(1800)).await;
+            if let Some(inner) = inner.upgrade() {
+                let mut upstream = inner.upstream.lock().await;
+                if upstream.get(&request_id) == Some(&generation) {
+                    upstream.remove(&request_id);
+                }
+            }
+        });
     }
 
     pub async fn upstream(&self, request_id: &str) -> bool {

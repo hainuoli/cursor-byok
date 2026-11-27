@@ -9,12 +9,12 @@ pub(crate) fn append_subagent_models(prompt: &mut PromptSpec, models: &[ByokMode
     let Some(task) = prompt.tools.iter_mut().find(|tool| tool.name == "Task") else {
         return;
     };
-    let mut models = models.iter().collect::<Vec<_>>();
-    models.sort_by(|left, right| {
-        left.display_name
-            .cmp(&right.display_name)
-            .then_with(|| left.hash.cmp(&right.hash))
-    });
+    let mut models = models.to_vec();
+    crate::cursor::tools::subagent_models::assign_slugs(
+        &mut models,
+        &std::collections::HashSet::new(),
+    );
+    models.sort_by(|left, right| left.hash.cmp(&right.hash));
     task.description.push_str(
         "\n\nAdditional available subagent models (BYOK)\n\n\
          These configured models are also available for explicit model requests. \
@@ -22,9 +22,15 @@ pub(crate) fn append_subagent_models(prompt: &mut PromptSpec, models: &[ByokMode
          Display names and model IDs can be ambiguous.\n",
     );
     for model in models {
+        let slug = if model.advertised_slug.is_empty() {
+            model.hash.as_str()
+        } else {
+            model.advertised_slug.as_str()
+        };
         task.description.push_str(&format!(
-            "\n- {}: model=\"{}\"",
+            "\n- {}: model=\"{}\" (hash=\"{}\")",
             serde_json::json!(model.display_name),
+            slug,
             model.hash,
         ));
     }
@@ -49,19 +55,31 @@ mod tests {
             hash: hash.into(),
             model_id: "gpt-x".into(),
             display_name: "Same\nName".into(),
+            advertised_slug: String::new(),
         });
         let mut first = base.clone();
         append_subagent_models(&mut first, &models);
         let mut second = base.clone();
         append_subagent_models(&mut second, &[models[1].clone(), models[0].clone()]);
-        assert_eq!(first, second);
+        let first_task = first
+            .tools
+            .iter()
+            .find(|tool| tool.name == "Task")
+            .map(|tool| tool.description.clone())
+            .unwrap_or_default();
+        let second_task = second
+            .tools
+            .iter()
+            .find(|tool| tool.name == "Task")
+            .map(|tool| tool.description.clone())
+            .unwrap_or_default();
+        assert_eq!(first_task, second_task);
         assert_eq!(first.instructions, base.instructions);
         for (original, rendered) in base.tools.iter().zip(&first.tools) {
             if original.name == "Task" {
                 assert!(rendered.description.starts_with(&original.description));
-                assert!(rendered
-                    .description
-                    .ends_with("- \"Same\\nName\": model=\"a\"\n- \"Same\\nName\": model=\"b\""));
+                assert!(rendered.description.contains("(hash=\"a\")"));
+                assert!(rendered.description.contains("(hash=\"b\")"));
             } else {
                 assert_eq!(original, rendered);
             }

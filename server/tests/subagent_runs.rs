@@ -25,11 +25,13 @@ fn ambiguous_model_names_require_a_hash() {
                 hash: "provider-a".into(),
                 model_id: "gpt-x".into(),
                 display_name: "GPT X via A".into(),
+                advertised_slug: String::new(),
             },
             ByokModel {
                 hash: "provider-b".into(),
                 model_id: "other-id".into(),
                 display_name: "gpt-x".into(),
+                advertised_slug: String::new(),
             },
         ],
         ..Default::default()
