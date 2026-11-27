@@ -108,12 +108,23 @@ impl CursorHarness {
         settings::clear_stale_managed_settings()
     }
 
+    pub async fn restore_if_enabled(&self) -> Result<()> {
+        if !self.inner.store.cursor_takeover_enabled().await? {
+            return Ok(());
+        }
+        if self.inner.backend_addr.read().is_none() {
+            return Ok(());
+        }
+        self.enable().await
+    }
+
     pub async fn status(&self) -> Result<CursorHarnessStatus> {
         let models = self.inner.store.models().await?;
         let configured_models = models.len();
         let enabled_models = configured_models;
         let ca = self.inner.ca.state()?;
-        if self.inner.store.cursor_takeover_enabled().await?
+        let takeover_enabled = self.inner.store.cursor_takeover_enabled().await?;
+        if takeover_enabled
             && matches!(ca, CaState::Ready)
             && self.inner.backend_addr.read().is_some()
         {
@@ -121,12 +132,18 @@ impl CursorHarness {
         }
         let proxy = self.inner.proxy.lock().await;
         let proxy_url = proxy.url();
-        let settings_applied = proxy_url
-            .as_deref()
-            .map(settings::settings_match)
-            .transpose()?
-            .unwrap_or(false);
-        let integration = match (proxy.running(), settings_applied) {
+        let proxy_running = proxy.running();
+        let settings_applied = refresh_settings_match(
+            takeover_enabled,
+            proxy_running,
+            proxy_url.as_deref(),
+            proxy_url
+                .as_deref()
+                .map(settings::settings_match)
+                .transpose()?
+                .unwrap_or(false),
+        )?;
+        let integration = match (proxy_running, settings_applied) {
             (false, false) => IntegrationState::Disabled,
             (true, true) => IntegrationState::Enabled,
             _ => IntegrationState::Degraded,
@@ -232,4 +249,50 @@ impl CursorHarness {
 async fn apply_cursor_configuration(proxy_url: &str) -> Result<()> {
     account::inject_if_missing().await?;
     settings::write_proxy_settings(proxy_url)
+}
+
+fn refresh_settings_match(
+    takeover_enabled: bool,
+    proxy_running: bool,
+    proxy_url: Option<&str>,
+    settings_applied: bool,
+) -> Result<bool> {
+    if !takeover_enabled || !proxy_running || settings_applied {
+        return Ok(settings_applied);
+    }
+    let Some(url) = proxy_url else {
+        return Ok(false);
+    };
+    match settings::write_proxy_settings(url) {
+        Ok(()) => settings::settings_match(url),
+        Err(error) => {
+            tracing::warn!(%error, "failed to rewrite Cursor proxy settings during status check");
+            Ok(false)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Store;
+
+    #[tokio::test]
+    async fn restore_if_enabled_skips_when_takeover_disabled() {
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", directory.path().join("harness.db").display());
+        let store = Store::connect(&url).await.unwrap();
+        store.set_cursor_takeover_enabled(false).await.unwrap();
+        let harness = CursorHarness::new(store).unwrap();
+        harness.set_backend_addr("127.0.0.1:51526".parse().unwrap());
+        harness.restore_if_enabled().await.unwrap();
+        assert!(harness.proxy_port().await.is_none());
+    }
+
+    #[test]
+    fn refresh_settings_match_skips_without_takeover_or_running_proxy() {
+        assert!(!refresh_settings_match(false, true, Some("http://127.0.0.1:1"), false).unwrap());
+        assert!(!refresh_settings_match(true, false, Some("http://127.0.0.1:1"), false).unwrap());
+        assert!(refresh_settings_match(true, true, Some("http://127.0.0.1:1"), true).unwrap());
+    }
 }

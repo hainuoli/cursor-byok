@@ -2,7 +2,7 @@
 mod project;
 mod service;
 pub(crate) mod upstream_sse;
-mod upstream_wire;
+pub(crate) mod upstream_wire;
 
 pub(crate) use project::project;
 pub(crate) use service::{decode_append, InferenceRoute, InferenceService};

@@ -1,9 +1,13 @@
 //! Exercises the client-owned Agent inference handshake and model stream.
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 
-use super::{router_with_proxy, CursorProxy};
+use super::CursorProxy;
 use crate::{
     cursor::{
+        inference::{upstream_wire, InferenceRoute, InferenceService},
         prompting::{PromptAssets, PromptCompiler},
         protocol::{
             connect,
@@ -23,6 +27,9 @@ use crate::{
 use axum::{
     body::{Body, Bytes},
     http::{header, Request, StatusCode},
+    response::Response,
+    routing::any,
+    Router,
 };
 use futures_util::{stream, StreamExt};
 use prost::Message;
@@ -633,7 +640,10 @@ fn router(store: crate::store::Store, provider: FakeProvider) -> (tempfile::Temp
     let registry = TransportRegistry::new(store, Arc::new(provider), PromptCompiler::new(assets));
     let proxy = CursorProxy::cursor(clients);
     let knowledge = KnowledgeService::with_root(directory.path().join("rules")).unwrap();
-    (directory, router_with_proxy(registry, proxy, knowledge))
+    (
+        directory,
+        super::router_with_proxy(registry, proxy, knowledge).0,
+    )
 }
 
 async fn temp_store() -> (tempfile::TempDir, Store) {
@@ -669,6 +679,254 @@ impl Provider for FakeProvider {
         let events = std::mem::take(&mut *self.events.lock().unwrap());
         Box::pin(stream::iter(events.into_iter().map(Ok)))
     }
+}
+
+fn poison_prost(mut encoded: Vec<u8>) -> Vec<u8> {
+    upstream_wire::append_length_delimited_field(&mut encoded, 3, b"wire-type-conflict");
+    encoded
+}
+
+async fn start_mock_upstream() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counted = hits.clone();
+    let app = Router::new().fallback(any(move |_: Request<Body>| {
+        let counted = counted.clone();
+        async move {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::empty())
+                .unwrap()
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, hits, server)
+}
+
+fn router_with_upstream(
+    store: Store,
+    provider: FakeProvider,
+    upstream: String,
+) -> (tempfile::TempDir, axum::Router, Arc<InferenceService>) {
+    let directory = tempfile::tempdir().unwrap();
+    let assets = PromptAssets::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("prompt/cursor")
+            .as_path(),
+    )
+    .unwrap();
+    let clients = NetworkClients::new(store.clone());
+    let registry = TransportRegistry::new(store, Arc::new(provider), PromptCompiler::new(assets));
+    let proxy = CursorProxy::with_upstream(clients, upstream);
+    let knowledge = KnowledgeService::with_root(directory.path().join("rules")).unwrap();
+    let (router, inference) = super::router_with_proxy(registry, proxy, knowledge);
+    (directory, router, inference)
+}
+
+async fn append_raw(router: &axum::Router, body: Vec<u8>) {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::post("/aiserver.v1.BidiService/BidiAppend")
+                .header(header::CONTENT_TYPE, "application/proto")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+async fn append_raw_expect_status(router: &axum::Router, body: Vec<u8>) -> StatusCode {
+    router
+        .clone()
+        .oneshot(
+            Request::post("/aiserver.v1.BidiService/BidiAppend")
+                .header(header::CONTENT_TYPE, "application/proto")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+fn bidi_append_bytes(request_id: &str, seqno: i64, payload: Vec<u8>) -> Vec<u8> {
+    let append = ai::BidiAppendRequest {
+        request_id: Some(ai::BidiRequestId {
+            request_id: request_id.into(),
+        }),
+        data_binary: payload,
+        append_seqno: seqno,
+        ..Default::default()
+    };
+    append.encode_to_vec()
+}
+
+async fn run_inference_sse_status(
+    router: &axum::Router,
+    request_id: &str,
+    poison_request_id: bool,
+) -> StatusCode {
+    let mut inner = agent::BidiRequestId {
+        request_id: request_id.into(),
+    }
+    .encode_to_vec();
+    if poison_request_id {
+        upstream_wire::append_length_delimited_field(&mut inner, 2, b"sse-wire-conflict");
+    }
+    let mut body = Vec::with_capacity(5 + inner.len());
+    body.push(0);
+    body.extend_from_slice(&(inner.len() as u32).to_be_bytes());
+    body.extend_from_slice(&inner);
+    router
+        .clone()
+        .oneshot(
+            Request::post("/aiserver.v1.InferenceService/RunInferenceSSE")
+                .header(header::CONTENT_TYPE, "application/proto")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn fail_open_official_session_survives_prost_decode_failures() {
+    let (_directory, store) = temp_store().await;
+    let provider = FakeProvider::default();
+    let (upstream, hits, _server) = start_mock_upstream().await;
+    let (_router_dir, router, inference) = router_with_upstream(store, provider, upstream);
+    let request_id = "fail-open-official";
+    let run = pb::RunInferenceClientMessage {
+        message: Some(pb::run_inference_client_message::Message::RunRequest(
+            pb::RunInferenceRunRequest {
+                conversation_id: "conv-fail-open".into(),
+                requested_model: Some(pb::InferenceRequestedModel {
+                    model_id: "composer-2".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )),
+    };
+    append_raw(
+        &router,
+        bidi_append_bytes(request_id, 0, poison_prost(run.encode_to_vec())),
+    )
+    .await;
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        inference.route(request_id),
+        Some(InferenceRoute::Upstream)
+    ));
+
+    assert_eq!(
+        run_inference_sse_status(&router, request_id, false).await,
+        StatusCode::OK
+    );
+    assert!(hits.load(Ordering::SeqCst) >= 2);
+
+    let invoke = pb::RunInferenceClientMessage {
+        message: Some(pb::run_inference_client_message::Message::InvokeModel(
+            pb::RunInferenceInvokeModel {
+                invocation_id: "invoke-fail-open".into(),
+                ..Default::default()
+            },
+        )),
+    };
+    append_raw(
+        &router,
+        bidi_append_bytes(request_id, 1, poison_prost(invoke.encode_to_vec())),
+    )
+    .await;
+    assert!(hits.load(Ordering::SeqCst) >= 3);
+
+    let finish = pb::RunInferenceClientMessage {
+        message: Some(pb::run_inference_client_message::Message::FinishRun(
+            pb::RunInferenceFinishRun {
+                aborted: false,
+                turn_completed: Some(true),
+                ..Default::default()
+            },
+        )),
+    };
+    append_raw(
+        &router,
+        bidi_append_bytes(request_id, 2, poison_prost(finish.encode_to_vec())),
+    )
+    .await;
+    assert!(hits.load(Ordering::SeqCst) >= 4);
+    assert!(inference.route(request_id).is_none());
+}
+
+#[tokio::test]
+async fn fail_open_unknown_bidi_append_and_poisoned_sse_request_id() {
+    let (_directory, store) = temp_store().await;
+    let provider = FakeProvider::default();
+    let (upstream, hits, _server) = start_mock_upstream().await;
+    let (_router_dir, router, inference) = router_with_upstream(store, provider, upstream);
+    let request_id = "fail-open-unknown";
+    let payload = poison_prost(
+        pb::RunInferenceClientMessage {
+            message: Some(pb::run_inference_client_message::Message::RunRequest(
+                pb::RunInferenceRunRequest {
+                    conversation_id: "conv-unknown".into(),
+                    requested_model: Some(pb::InferenceRequestedModel {
+                        model_id: "gpt-5.6-sol-medium".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )),
+        }
+        .encode_to_vec(),
+    );
+    let mut body = bidi_append_bytes(request_id, 0, payload);
+    upstream_wire::append_length_delimited_field(&mut body, 99, b"unknown-oneof");
+    append_raw(&router, body).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        inference.route(request_id),
+        Some(InferenceRoute::Upstream)
+    ));
+    assert_eq!(
+        run_inference_sse_status(&router, request_id, true).await,
+        StatusCode::OK
+    );
+    assert!(hits.load(Ordering::SeqCst) >= 2);
+}
+
+#[tokio::test]
+async fn local_byok_corrupted_run_request_returns_400_without_upstream_leak() {
+    let (_directory, store) = temp_store().await;
+    let model = store.create_model(&model_input()).await.unwrap();
+    let provider = FakeProvider::default();
+    let (upstream, hits, _server) = start_mock_upstream().await;
+    let (_router_dir, router, _inference) = router_with_upstream(store, provider, upstream);
+    let request_id = "fail-closed-local";
+    let run = pb::RunInferenceClientMessage {
+        message: Some(pb::run_inference_client_message::Message::RunRequest(
+            pb::RunInferenceRunRequest {
+                conversation_id: "conv-local".into(),
+                requested_model: Some(pb::InferenceRequestedModel {
+                    model_id: model.model_hash.clone(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )),
+    };
+    let status = append_raw_expect_status(
+        &router,
+        bidi_append_bytes(request_id, 0, poison_prost(run.encode_to_vec())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
 }
 
 fn model_input() -> ModelConfigInput {

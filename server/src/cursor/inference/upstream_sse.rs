@@ -72,16 +72,29 @@ impl UpstreamRewrite {
                         config_fingerprint = %patched.fingerprint,
                         "upstream_sse: patched RunReady with BYOK subagent models"
                     );
-                    let body = compress_if_needed(flags, &patched.body)?;
-                    out.push(encode_connect_frame(flags, body));
-                    self.ready_rewritten = true;
+                    match compress_if_needed(flags, &patched.body) {
+                        Ok(body) => {
+                            out.push(encode_connect_frame(flags, body));
+                            self.ready_rewritten = true;
+                        }
+                        Err(error) => {
+                            warn!(
+                                %error,
+                                "upstream_sse: RunReady recompress failed, forwarding frame unchanged"
+                            );
+                            out.push(envelope);
+                            self.ready_rewritten = true;
+                        }
+                    }
                 }
                 Err(error) => {
                     if had_run_ready {
                         warn!(
                             %error,
-                            "upstream_sse: RunReady wire patch failed, withholding frame"
+                            "upstream_sse: RunReady wire patch failed, forwarding frame unchanged"
                         );
+                        out.push(envelope);
+                        self.ready_rewritten = true;
                     } else {
                         warn!(
                             %error,
@@ -787,5 +800,81 @@ mod tests {
         let (value, end) = decode_varint(&encoded, 0).unwrap();
         assert_eq!(value, 300);
         assert_eq!(end, encoded.len());
+    }
+
+    fn corrupt_subagent_config_tag49_frame() -> Bytes {
+        let baseline = ready_message();
+        let outer = connect::encode_message(&baseline).unwrap();
+        let payload = outer.slice(5..);
+        let fields = scan_fields(&payload).unwrap();
+        let run_ready = fields
+            .iter()
+            .find(|field| field.number == SERVER_TAG_RUN_READY)
+            .unwrap()
+            .value;
+        let run_fields = scan_fields(run_ready).unwrap();
+        let metadata = run_fields
+            .iter()
+            .find(|field| field.number == RUN_READY_TAG_PROMPT_METADATA)
+            .unwrap()
+            .value;
+        let meta_fields = scan_fields(metadata).unwrap();
+        let mut poisoned_metadata = meta_fields
+            .iter()
+            .filter(|field| field.number != PROMPT_METADATA_TAG_SUBAGENT_CONFIG)
+            .flat_map(|field| field.raw.iter().copied())
+            .collect::<Vec<_>>();
+        append_length_delimited_field(
+            &mut poisoned_metadata,
+            PROMPT_METADATA_TAG_SUBAGENT_CONFIG,
+            &[0xff, 0x01],
+        );
+
+        let mut poisoned_run_ready = Vec::new();
+        for field in run_fields {
+            if field.number == RUN_READY_TAG_PROMPT_METADATA {
+                poisoned_run_ready.extend(encode_length_delimited_field(
+                    RUN_READY_TAG_PROMPT_METADATA,
+                    &poisoned_metadata,
+                ));
+            } else {
+                poisoned_run_ready.extend_from_slice(field.raw);
+            }
+        }
+
+        let mut poisoned_outer = Vec::new();
+        for field in fields {
+            if field.number == SERVER_TAG_RUN_READY {
+                poisoned_outer.extend(encode_length_delimited_field(
+                    SERVER_TAG_RUN_READY,
+                    &poisoned_run_ready,
+                ));
+            } else {
+                poisoned_outer.extend_from_slice(field.raw);
+            }
+        }
+        let mut frame = bytes::BytesMut::with_capacity(5 + poisoned_outer.len());
+        frame.put_u8(0);
+        frame.put_u32(poisoned_outer.len() as u32);
+        frame.extend_from_slice(&poisoned_outer);
+        frame.freeze()
+    }
+
+    #[test]
+    fn forwards_run_ready_unchanged_when_tag49_merge_fails() {
+        let frame = corrupt_subagent_config_tag49_frame();
+        let byok = vec![pb::RunInferenceSubagentModelPolicy {
+            slug: "byok-slug".into(),
+            advertised: true,
+            valid: true,
+            ..Default::default()
+        }];
+        let mut rewrite = UpstreamRewrite::new(byok, OfficialCatalog::new(), [0u8; 32]);
+        let out = rewrite.ingest(frame.clone()).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0], frame,
+            "patch failure must forward original envelope"
+        );
     }
 }

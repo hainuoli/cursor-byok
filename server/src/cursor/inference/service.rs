@@ -30,10 +30,12 @@ use super::project;
 
 /// Cursor's subagent model policies; `none` leaves model selection to the client.
 const SUBAGENT_FORCE_POLICY_NONE: &str = "none";
+const UPSTREAM_ROUTE_IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(1800);
 
 #[derive(Clone)]
 pub(crate) struct InferenceService {
     state: Arc<Mutex<HashMap<String, InferenceRoute>>>,
+    upstream_generations: Arc<Mutex<HashMap<String, u64>>>,
     changed: Arc<Notify>,
     registry: TransportRegistry,
     catalog: OfficialCatalog,
@@ -114,6 +116,7 @@ impl InferenceService {
     pub fn new(registry: TransportRegistry, catalog: OfficialCatalog, proxy: CursorProxy) -> Self {
         Self {
             state: Arc::new(Mutex::new(HashMap::new())),
+            upstream_generations: Arc::new(Mutex::new(HashMap::new())),
             changed: Arc::new(Notify::new()),
             registry,
             catalog,
@@ -247,9 +250,86 @@ impl InferenceService {
             .entry(request_id.into())
             .or_insert_with(|| route.clone())
             .clone();
+        let is_upstream = matches!(route, InferenceRoute::Upstream);
         drop(state);
+        if is_upstream {
+            self.schedule_upstream_idle_eviction(request_id);
+        }
         self.changed.notify_waiters();
         Ok(route)
+    }
+
+    /// Marks `request_id` as an upstream route (or refreshes its idle TTL if already upstream).
+    pub fn mark_upstream(&self, request_id: &str) {
+        let inserted_or_upstream = {
+            let mut state = self.state.lock();
+            match state.get(request_id) {
+                Some(InferenceRoute::Local(_)) => false,
+                Some(InferenceRoute::Upstream) => true,
+                None => {
+                    state.insert(request_id.into(), InferenceRoute::Upstream);
+                    true
+                }
+            }
+        };
+        if inserted_or_upstream {
+            self.schedule_upstream_idle_eviction(request_id);
+            self.changed.notify_waiters();
+        }
+    }
+
+    fn schedule_upstream_idle_eviction(&self, request_id: &str) {
+        let generation = {
+            let mut generations = self.upstream_generations.lock();
+            let next = generations.get(request_id).copied().unwrap_or_default() + 1;
+            generations.insert(request_id.into(), next);
+            next
+        };
+        let state = Arc::downgrade(&self.state);
+        let generations = Arc::downgrade(&self.upstream_generations);
+        let request_id = request_id.to_owned();
+        tokio::spawn(async move {
+            tokio::time::sleep(UPSTREAM_ROUTE_IDLE_TTL).await;
+            let (Some(state), Some(generations)) = (state.upgrade(), generations.upgrade()) else {
+                return;
+            };
+            let mut state_guard = state.lock();
+            let mut gen_guard = generations.lock();
+            if gen_guard.get(&request_id) == Some(&generation) {
+                gen_guard.remove(&request_id);
+                if matches!(state_guard.get(&request_id), Some(InferenceRoute::Upstream)) {
+                    state_guard.remove(&request_id);
+                }
+            }
+        });
+    }
+
+    /// Determines whether `model_id` resolves to a configured BYOK or plugin model.
+    pub async fn is_local_model(&self, model_id: &str, headers: &HeaderMap) -> Result<bool> {
+        if model_id.starts_with(crate::plugin::ADAPTER_ID_PREFIX) {
+            return Ok(true);
+        }
+        if self.registry.store().model(model_id).await?.is_some() {
+            return Ok(true);
+        }
+        let store_models = self.registry.store().models().await?;
+        if store_models.is_empty() {
+            return Ok(false);
+        }
+        let byok_hashes = store_models
+            .iter()
+            .map(|model| model.model_hash.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let token = OfficialCatalog::token_key(headers);
+        let official = self
+            .catalog
+            .get_or_fetch(token, headers, &self.proxy, &byok_hashes)
+            .await;
+        let reserved = official_reserved(&official);
+        Ok(self
+            .resolve_by_display_name(model_id, &reserved)
+            .await?
+            .is_some())
     }
 
     pub fn subscribe(
@@ -273,6 +353,7 @@ impl InferenceService {
 
     pub fn finish(&self, request_id: &str) {
         self.state.lock().remove(request_id);
+        self.upstream_generations.lock().remove(request_id);
     }
 
     /// Resolves a Task `model` argument that names a model by display name.

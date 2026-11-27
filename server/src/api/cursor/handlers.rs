@@ -1,4 +1,6 @@
 //! Implements Cursor HTTP endpoints outside the Agent Run stream.
+use std::sync::Arc;
+
 use axum::{
     body::{to_bytes, Body, Bytes},
     extract::{DefaultBodyLimit, Extension, State},
@@ -19,7 +21,7 @@ use crate::{
         inference::{
             decode_append,
             upstream_sse::{prepare_upstream_headers, UpstreamRewrite},
-            InferenceRoute, InferenceService,
+            upstream_wire, InferenceRoute, InferenceService,
         },
         protocol::{
             connect,
@@ -40,20 +42,20 @@ pub fn router(
 ) -> Result<Router> {
     let proxy = CursorProxy::cursor(clients);
     let knowledge = knowledge::KnowledgeService::managed()?;
-    Ok(router_with_proxy(registry, proxy, knowledge))
+    Ok(router_with_proxy(registry, proxy, knowledge).0)
 }
 
 fn router_with_proxy(
     registry: TransportRegistry,
     proxy: CursorProxy,
     knowledge_service: knowledge::KnowledgeService,
-) -> Router {
+) -> (Router, Arc<InferenceService>) {
     let web_cache = registry.web_cache().router();
     let free_entitlements = FreeEntitlementCache::default();
     let official_catalog = OfficialCatalog::new();
     let inference_service =
         InferenceService::new(registry.clone(), official_catalog.clone(), proxy.clone());
-    Router::new()
+    let router = Router::new()
         .route("/__byok-api__/healthz", get(health))
         .route("/agent.v1.AgentService/RunSSE", post(run_sse_handler))
         .route(
@@ -176,10 +178,11 @@ fn router_with_proxy(
         .layer(Extension(proxy))
         .layer(Extension(knowledge_service))
         .layer(Extension(free_entitlements))
-        .layer(Extension(inference_service))
+        .layer(Extension(inference_service.clone()))
         .layer(Extension(official_catalog))
         .with_state(registry)
-        .merge(web_cache)
+        .merge(web_cache);
+    (router, Arc::new(inference_service))
 }
 
 async fn health() -> StatusCode {
@@ -203,24 +206,56 @@ async fn is_connected() -> Result<Response<Body>> {
     Ok(response)
 }
 
+fn extract_sse_request_id(body: &[u8]) -> Result<String> {
+    match connect::decode_unary::<agent::BidiRequestId>(body) {
+        Ok(request) if !request.request_id.is_empty() => Ok(request.request_id),
+        Ok(_) => upstream_wire::sniff_bidi_request_id(body)
+            .ok_or_else(|| crate::Error::Protocol("SSE request_id is required".into())),
+        Err(error) => upstream_wire::sniff_bidi_request_id(body).ok_or(error),
+    }
+}
+
+async fn fail_open_upstream(
+    inference_service: &InferenceService,
+    registry: &TransportRegistry,
+    request_id: &str,
+) {
+    inference_service.mark_upstream(request_id);
+    registry.mark_upstream(request_id).await;
+}
+
 async fn run_sse_handler(
     State(registry): State<TransportRegistry>,
     Extension(proxy): Extension<CursorProxy>,
     request: Request<Body>,
 ) -> Result<Response<Body>> {
     let (parts, body) = buffered(request).await?;
-    let request: agent::BidiRequestId = connect::decode_unary(&body)?;
-    let route = registry.wait_route(&request.request_id).await;
-    let trace = registry.trace(&request.request_id);
+    let request_id = match extract_sse_request_id(&body) {
+        Ok(request_id) => request_id,
+        Err(error)
+            if !body.is_empty()
+                && !crate::local_app::request_uses_local_cursor_token(&parts.headers) =>
+        {
+            tracing::warn!(%error, "RunSSE request_id decode failed; failing open to Cursor upstream");
+            return proxy::forward(
+                Extension(proxy),
+                Request::from_parts(parts, Body::from(body)),
+            )
+            .await;
+        }
+        Err(error) => return Err(error),
+    };
+    let route = registry.wait_route(&request_id).await;
+    let trace = registry.trace(&request_id);
     trace.resume();
     trace.request(
         "run_sse_request",
         body.clone(),
-        serde_json::json!({"request_id": request.request_id}),
+        serde_json::json!({"request_id": request_id}),
     );
     match route {
         crate::cursor::transport::TransportRoute::Local => {
-            run_sse::stream(&registry, &request.request_id).await
+            run_sse::stream(&registry, &request_id).await
         }
         crate::cursor::transport::TransportRoute::Upstream(generation) => {
             let response = proxy::forward(
@@ -228,14 +263,7 @@ async fn run_sse_handler(
                 Request::from_parts(parts, Body::from(body)),
             )
             .await?;
-            Ok(run_sse::upstream(
-                registry,
-                request.request_id,
-                generation,
-                response,
-                Some(trace),
-            )
-            .await)
+            Ok(run_sse::upstream(registry, request_id, generation, response, Some(trace)).await)
         }
     }
 }
@@ -247,11 +275,24 @@ async fn run_inference_sse_handler(
     request: Request<Body>,
 ) -> Result<Response<Body>> {
     let (parts, body) = buffered(request).await?;
-    let request: agent::BidiRequestId = connect::decode_unary(&body)?;
-    let request_id = request.request_id;
+    let request_id = match extract_sse_request_id(&body) {
+        Ok(request_id) => request_id,
+        Err(error)
+            if !body.is_empty()
+                && !crate::local_app::request_uses_local_cursor_token(&parts.headers) =>
+        {
+            tracing::warn!(%error, "RunInferenceSSE request_id decode failed; failing open to Cursor upstream");
+            return proxy::forward(
+                Extension(proxy),
+                Request::from_parts(parts, Body::from(body)),
+            )
+            .await;
+        }
+        Err(error) => return Err(error),
+    };
     match inference_service.wait_route(&request_id).await {
         InferenceRoute::Upstream => {
-            let models = registry.store().models().await?;
+            let models = registry.store().models().await.unwrap_or_default();
             let reserved = inference_service
                 .catalog()
                 .slug_set(OfficialCatalog::token_key(&parts.headers));
@@ -321,6 +362,93 @@ async fn run_inference_sse_handler(
     }
 }
 
+struct ParsedBidiEnvelope {
+    request_id: String,
+    append_seqno: i64,
+    payload: Vec<u8>,
+}
+
+enum EnvelopeParse {
+    Parsed(ParsedBidiEnvelope),
+    FailOpenUpstream(crate::Error),
+}
+
+fn parse_bidi_envelope(body: &[u8], can_fail_open: bool) -> Result<EnvelopeParse> {
+    match connect::decode_unary::<ai::BidiAppendRequest>(body) {
+        Ok(request) => {
+            let request_id = request
+                .request_id
+                .as_ref()
+                .map(|id| id.request_id.as_str())
+                .filter(|id| !id.is_empty());
+            let Some(request_id) = request_id else {
+                if can_fail_open
+                    && !body.is_empty()
+                    && request.data.is_empty()
+                    && request.data_binary.is_empty()
+                    && request.append_seqno == 0
+                {
+                    return Ok(EnvelopeParse::FailOpenUpstream(crate::Error::Protocol(
+                        "BidiAppend request_id missing on unrecognized envelope".into(),
+                    )));
+                }
+                return Err(crate::Error::Protocol(
+                    "BidiAppend request_id is required".into(),
+                ));
+            };
+            let payload = match (request.data.is_empty(), request.data_binary.is_empty()) {
+                (true, false) => request.data_binary,
+                (false, true) => hex::decode(&request.data).map_err(|error| {
+                    crate::Error::Protocol(format!("invalid BidiAppend hex: {error}"))
+                })?,
+                (true, true) => {
+                    return Err(crate::Error::Protocol(
+                        "BidiAppend contains no AgentClientMessage".into(),
+                    ));
+                }
+                (false, false) => {
+                    return Err(crate::Error::Protocol(
+                        "BidiAppend contains both data and data_binary".into(),
+                    ));
+                }
+            };
+            Ok(EnvelopeParse::Parsed(ParsedBidiEnvelope {
+                request_id: request_id.to_owned(),
+                append_seqno: request.append_seqno,
+                payload,
+            }))
+        }
+        Err(error) => {
+            if let Some(sniffed) = upstream_wire::sniff_bidi_append_envelope(body) {
+                return Ok(EnvelopeParse::Parsed(ParsedBidiEnvelope {
+                    request_id: sniffed.request_id,
+                    append_seqno: 0,
+                    payload: sniffed.payload,
+                }));
+            }
+            if can_fail_open && !body.is_empty() {
+                Ok(EnvelopeParse::FailOpenUpstream(error))
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+fn decode_agent_append(
+    request_id: &str,
+    append_seqno: i64,
+    payload: &[u8],
+) -> Result<bidi::DecodedAppend> {
+    use prost::Message;
+    let message = agent::AgentClientMessage::decode(payload)?;
+    Ok(bidi::DecodedAppend {
+        request_id: request_id.to_owned(),
+        seqno: append_seqno,
+        message,
+    })
+}
+
 async fn bidi_handler(
     State(registry): State<TransportRegistry>,
     Extension(proxy): Extension<CursorProxy>,
@@ -328,125 +456,114 @@ async fn bidi_handler(
     request: Request<Body>,
 ) -> Result<Response<Body>> {
     let (parts, body) = buffered(request).await?;
-    let request: ai::BidiAppendRequest = connect::decode_unary(&body)?;
-    let request_id = request
-        .request_id
-        .as_ref()
-        .map(|id| id.request_id.as_str())
-        .filter(|id| !id.is_empty())
-        .ok_or_else(|| crate::Error::Protocol("BidiAppend request_id is required".into()))?;
-    let payload = if request.data_binary.is_empty() {
-        hex::decode(&request.data)
-            .map_err(|error| crate::Error::Protocol(format!("invalid BidiAppend hex: {error}")))?
-    } else {
-        request.data_binary.clone()
+    let can_fail_open = !crate::local_app::request_uses_local_cursor_token(&parts.headers);
+    let ParsedBidiEnvelope {
+        request_id,
+        append_seqno,
+        payload,
+    } = match parse_bidi_envelope(&body, can_fail_open)? {
+        EnvelopeParse::Parsed(parsed) => parsed,
+        EnvelopeParse::FailOpenUpstream(error) => {
+            tracing::warn!(%error, "BidiAppend outer decode failed; failing open to Cursor upstream");
+            return proxy::forward(
+                Extension(proxy),
+                Request::from_parts(parts, Body::from(body)),
+            )
+            .await;
+        }
     };
-    let current_route = inference_service.route(request_id);
-    let candidate = decode_append(&payload).ok();
-    let starts_inference = candidate.as_ref().is_some_and(|message| {
-        matches!(
-            message.message.as_ref(),
-            Some(inference::run_inference_client_message::Message::RunRequest(run))
-                if !run.conversation_id.is_empty()
-                    && run.requested_model.as_ref().is_some_and(|model| !model.model_id.is_empty())
-        )
-    });
-    if current_route.is_some() || starts_inference {
-        let message = candidate
-            .ok_or_else(|| crate::Error::Protocol("invalid RunInference client message".into()))?;
-        let route = match current_route {
-            Some(route) => route,
-            None => {
-                inference_service
-                    .begin(request_id, &message, &parts.headers)
-                    .await?
+
+    // Fast-path 1: already routed on InferenceService.
+    match inference_service.route(&request_id) {
+        Some(InferenceRoute::Local(run)) => {
+            let message = decode_append(&payload)?;
+            run.append(append_seqno, message).await?;
+            let mut response = Response::new(Body::empty());
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/proto"),
+            );
+            return Ok(response);
+        }
+        Some(InferenceRoute::Upstream) => {
+            inference_service.mark_upstream(&request_id);
+            let finished = upstream_wire::sniff_client_finish_run(&payload);
+            let response = proxy::forward(
+                Extension(proxy),
+                Request::from_parts(parts, Body::from(body)),
+            )
+            .await;
+            if finished {
+                inference_service.finish(&request_id);
+            }
+            return response;
+        }
+        None => {}
+    }
+
+    // Fast-path 2: already routed on legacy TransportRegistry.
+    if registry.local(&request_id).await.is_some() {
+        let decoded = decode_agent_append(&request_id, append_seqno, &payload)?;
+        let trace_metadata = decoded.trace_metadata();
+        let trace = registry.trace(&decoded.request_id);
+        trace.resume();
+        let parent = match parent_headers(&parts.headers) {
+            Ok(parent) => parent,
+            Err(error) => {
+                trace.request(
+                    "bidi_request",
+                    body,
+                    trace_outcome(
+                        trace_metadata,
+                        false,
+                        "invalid_parent",
+                        Some(error.to_string()),
+                    ),
+                );
+                return Err(error);
             }
         };
-        match route {
-            InferenceRoute::Local(run) => {
-                run.append(request.append_seqno, message).await?;
-                let mut response = Response::new(Body::empty());
-                response.headers_mut().insert(
-                    header::CONTENT_TYPE,
-                    HeaderValue::from_static("application/proto"),
+        match bidi::append(&registry, decoded, parent).await {
+            Ok(_) => trace.request(
+                "bidi_request",
+                body,
+                trace_outcome(trace_metadata, true, "local", None),
+            ),
+            Err(error) => {
+                trace.request(
+                    "bidi_request",
+                    body,
+                    trace_outcome(
+                        trace_metadata,
+                        false,
+                        "command_rejected",
+                        Some(error.to_string()),
+                    ),
                 );
-                return Ok(response);
-            }
-            InferenceRoute::Upstream => {
-                let finished = matches!(
-                    message.message,
-                    Some(inference::run_inference_client_message::Message::FinishRun(
-                        _
-                    ))
-                );
-                let response = proxy::forward(
-                    Extension(proxy),
-                    Request::from_parts(parts, Body::from(body)),
-                )
-                .await;
-                if finished {
-                    inference_service.finish(request_id);
-                }
-                return response;
+                return Err(error);
             }
         }
-    }
-    let decoded = bidi::decode(&request)?;
-    let first_model = decoded.model_id().map(str::to_owned);
-    let conversation_id = decoded.conversation_id().map(str::to_owned);
-    let trace_metadata = decoded.trace_metadata();
-    let trace = registry.trace(&decoded.request_id);
-    let local = if let Some(model_id) = decoded.model_id() {
-        // 插件模型 ID 只在本地有意义,永远不转发到 Cursor 官方上游。
-        if model_id.starts_with(crate::plugin::ADAPTER_ID_PREFIX)
-            || registry.store().model(model_id).await?.is_some()
-        {
-            tracing::info!(
-                request_id = decoded.request_id,
-                model_id,
-                "routing Cursor Run to BYOK provider"
-            );
-            true
-        } else {
-            tracing::info!(
-                request_id = decoded.request_id,
-                model_id,
-                "routing Cursor Run to Cursor upstream"
-            );
-            false
-        }
-    } else if registry.local(&decoded.request_id).await.is_some() {
-        true
-    } else if registry.upstream(&decoded.request_id).await {
-        false
-    } else {
-        trace.resume();
-        trace.request(
-            "bidi_request",
-            body.clone(),
-            trace_outcome(trace_metadata, false, "missing_transport", None),
+        let mut response = Response::new(axum::body::Body::empty());
+        *response.status_mut() = StatusCode::OK;
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/proto"),
         );
-        return Err(crate::Error::Protocol(
-            "first BidiAppend message must select a model".into(),
-        ));
-    };
-    if first_model.is_some() {
-        trace.begin(
-            conversation_id.as_deref(),
-            if local {
-                "local_byok"
-            } else {
-                "cursor_official"
-            },
-            first_model.as_deref(),
-        );
-    } else {
-        trace.resume();
+        return Ok(response);
     }
-    if !local {
-        if first_model.is_some() {
-            registry.mark_upstream(&decoded.request_id).await;
-        }
+
+    if registry.upstream(&request_id).await {
+        registry.mark_upstream(&request_id).await;
+        let trace = registry.trace(&request_id);
+        trace.resume();
+        let trace_metadata = decode_agent_append(&request_id, append_seqno, &payload)
+            .map(|decoded| decoded.trace_metadata())
+            .unwrap_or_else(|_| {
+                serde_json::json!({
+                    "append_seqno": append_seqno,
+                    "message_type": "raw_upstream_passthrough",
+                })
+            });
         trace.request(
             "bidi_request",
             body.clone(),
@@ -458,49 +575,196 @@ async fn bidi_handler(
         )
         .await;
     }
-    let parent = match parent_headers(&parts.headers) {
-        Ok(parent) => parent,
-        Err(error) => {
-            trace.request(
-                "bidi_request",
-                body,
-                trace_outcome(
-                    trace_metadata,
-                    false,
-                    "invalid_parent",
-                    Some(error.to_string()),
-                ),
-            );
-            return Err(error);
-        }
-    };
-    match bidi::append(&registry, decoded, parent).await {
-        Ok(_) => trace.request(
-            "bidi_request",
-            body,
-            trace_outcome(trace_metadata, true, "local", None),
-        ),
-        Err(error) => {
-            trace.request(
-                "bidi_request",
-                body,
-                trace_outcome(
-                    trace_metadata,
-                    false,
-                    "command_rejected",
-                    Some(error.to_string()),
-                ),
-            );
-            return Err(error);
+
+    // Route discovery for a new request_id.
+    let inference_decode = decode_append(&payload);
+    if let Ok(message) = &inference_decode {
+        let starts_inference = matches!(
+            message.message.as_ref(),
+            Some(inference::run_inference_client_message::Message::RunRequest(run))
+                if !run.conversation_id.is_empty()
+                    && run.requested_model.as_ref().is_some_and(|model| !model.model_id.is_empty())
+        );
+        if starts_inference {
+            let route = inference_service
+                .begin(&request_id, message, &parts.headers)
+                .await?;
+            match route {
+                InferenceRoute::Local(run) => {
+                    run.append(append_seqno, message.clone()).await?;
+                    let mut response = Response::new(Body::empty());
+                    response.headers_mut().insert(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/proto"),
+                    );
+                    return Ok(response);
+                }
+                InferenceRoute::Upstream => {
+                    return proxy::forward(
+                        Extension(proxy),
+                        Request::from_parts(parts, Body::from(body)),
+                    )
+                    .await;
+                }
+            }
         }
     }
-    let mut response = Response::new(axum::body::Body::empty());
-    *response.status_mut() = StatusCode::OK;
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/proto"),
+
+    if let Ok(decoded) = decode_agent_append(&request_id, append_seqno, &payload) {
+        if let Some(model_id) = decoded.model_id().map(str::to_owned) {
+            let conversation_id = decoded.conversation_id().map(str::to_owned);
+            let trace_metadata = decoded.trace_metadata();
+            let trace = registry.trace(&decoded.request_id);
+            // 插件模型 ID 只在本地有意义,永远不转发到 Cursor 官方上游。
+            let local = if model_id.starts_with(crate::plugin::ADAPTER_ID_PREFIX)
+                || registry.store().model(&model_id).await?.is_some()
+            {
+                tracing::info!(
+                    request_id = decoded.request_id,
+                    model_id,
+                    "routing Cursor Run to BYOK provider"
+                );
+                true
+            } else {
+                tracing::info!(
+                    request_id = decoded.request_id,
+                    model_id,
+                    "routing Cursor Run to Cursor upstream"
+                );
+                false
+            };
+            trace.begin(
+                conversation_id.as_deref(),
+                if local {
+                    "local_byok"
+                } else {
+                    "cursor_official"
+                },
+                Some(model_id.as_str()),
+            );
+            if !local {
+                registry.mark_upstream(&decoded.request_id).await;
+                trace.request(
+                    "bidi_request",
+                    body.clone(),
+                    trace_outcome(trace_metadata, true, "upstream", None),
+                );
+                return proxy::forward(
+                    Extension(proxy),
+                    Request::from_parts(parts, Body::from(body)),
+                )
+                .await;
+            }
+            let parent = match parent_headers(&parts.headers) {
+                Ok(parent) => parent,
+                Err(error) => {
+                    trace.request(
+                        "bidi_request",
+                        body,
+                        trace_outcome(
+                            trace_metadata,
+                            false,
+                            "invalid_parent",
+                            Some(error.to_string()),
+                        ),
+                    );
+                    return Err(error);
+                }
+            };
+            match bidi::append(&registry, decoded, parent).await {
+                Ok(_) => trace.request(
+                    "bidi_request",
+                    body,
+                    trace_outcome(trace_metadata, true, "local", None),
+                ),
+                Err(error) => {
+                    trace.request(
+                        "bidi_request",
+                        body,
+                        trace_outcome(
+                            trace_metadata,
+                            false,
+                            "command_rejected",
+                            Some(error.to_string()),
+                        ),
+                    );
+                    return Err(error);
+                }
+            }
+            let mut response = Response::new(axum::body::Body::empty());
+            *response.status_mut() = StatusCode::OK;
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/proto"),
+            );
+            return Ok(response);
+        }
+    }
+
+    // Tier 2: prost failed to decode a modified RunRequest, inspect model_id via raw TLV scan.
+    if let Some(sniffed) = upstream_wire::sniff_client_run_start(&payload) {
+        let is_local = inference_service
+            .is_local_model(&sniffed.model_id, &parts.headers)
+            .await
+            .unwrap_or(false);
+        if is_local {
+            let reason = inference_decode
+                .err()
+                .map(|err| err.to_string())
+                .unwrap_or_else(|| "incomplete RunRequest".into());
+            return Err(crate::Error::Protocol(format!(
+                "RunRequest for local BYOK model '{}' failed protobuf decode: {reason}",
+                sniffed.model_id
+            )));
+        }
+        if can_fail_open {
+            tracing::warn!(
+                request_id,
+                model_id = %sniffed.model_id,
+                "client RunRequest prost decode failed; TLV sniffer failing open to Cursor upstream"
+            );
+            fail_open_upstream(&inference_service, &registry, &request_id).await;
+            return proxy::forward(
+                Extension(proxy),
+                Request::from_parts(parts, Body::from(body)),
+            )
+            .await;
+        }
+    }
+
+    // Tier 3: Ultimate fail-open for unrecognized or pre-start upstream BidiAppend payloads.
+    if can_fail_open {
+        tracing::warn!(
+            request_id,
+            payload_len = payload.len(),
+            "unrecognized or non-start BidiAppend on new request_id; failing open to Cursor upstream"
+        );
+        fail_open_upstream(&inference_service, &registry, &request_id).await;
+        return proxy::forward(
+            Extension(proxy),
+            Request::from_parts(parts, Body::from(body)),
+        )
+        .await;
+    }
+
+    let trace = registry.trace(&request_id);
+    trace.resume();
+    trace.request(
+        "bidi_request",
+        body,
+        trace_outcome(
+            serde_json::json!({
+                "append_seqno": append_seqno,
+                "message_type": "unrecognized",
+            }),
+            false,
+            "missing_transport",
+            None,
+        ),
     );
-    Ok(response)
+    Err(crate::Error::Protocol(
+        "first BidiAppend message must select a model".into(),
+    ))
 }
 
 fn trace_outcome(

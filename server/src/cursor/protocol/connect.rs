@@ -98,7 +98,16 @@ pub fn decode_unary<M: Message + Default>(body: &[u8]) -> Result<M> {
         let flags = body[0];
         let length = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
         if flags & END_STREAM_FLAG == 0 && length == body.len() - 5 {
-            return Ok(M::decode(&body[5..])?);
+            return match flags {
+                0 => Ok(M::decode(&body[5..])?),
+                COMPRESSION_FLAG => {
+                    let raw = decompress_payload(flags, Bytes::copy_from_slice(&body[5..]))?;
+                    Ok(M::decode(raw)?)
+                }
+                _ => Err(Error::Protocol(format!(
+                    "unsupported Connect unary flags: {flags:#x}"
+                ))),
+            };
         }
     }
     Ok(M::decode(body)?)
@@ -222,5 +231,15 @@ mod streaming_tests {
         let raw = decompress_payload(flags, body).unwrap();
         let decoded: Tiny = Message::decode(raw).unwrap();
         assert_eq!(decoded.value, "gz");
+        let unary: Tiny = decode_unary(&frame).unwrap();
+        assert_eq!(unary.value, "gz");
+    }
+
+    #[test]
+    fn decode_unary_rejects_unknown_envelope_flags_cleanly() {
+        let mut envelope = BytesMut::from(&[0x04, 0, 0, 0, 2, 0x0a, 0x00][..]);
+        let frame = envelope.split().freeze();
+        let err = decode_unary::<Tiny>(&frame).unwrap_err();
+        assert!(err.to_string().contains("unsupported Connect unary flags"));
     }
 }

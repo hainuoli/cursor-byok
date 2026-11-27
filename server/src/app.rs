@@ -143,6 +143,12 @@ impl App {
         let address = listener.local_addr()?;
         self.registry.web_cache().set_service_addr(address);
         self.harness.set_backend_addr(address);
+        let harness = self.harness.clone();
+        tokio::spawn(async move {
+            if let Err(error) = harness.restore_if_enabled().await {
+                tracing::warn!(%error, "failed to restore Cursor harness on startup");
+            }
+        });
         tracing::info!(%address, "cursor server listening");
         let registry = self.registry;
         let harness = self.harness;

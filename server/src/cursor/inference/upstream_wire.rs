@@ -348,7 +348,275 @@ pub(crate) fn contains_run_ready_field(body: &[u8]) -> bool {
     })
 }
 
+const CLIENT_TAG_RUN_REQUEST: u32 = 1;
+const CLIENT_TAG_FINISH_RUN: u32 = 4;
+const BIDI_REQUEST_TAG_DATA_HEX: u32 = 1;
+const BIDI_REQUEST_TAG_REQUEST_ID: u32 = 2;
+const BIDI_REQUEST_TAG_DATA_BINARY: u32 = 4;
+const BIDI_REQUEST_ID_TAG_ID: u32 = 1;
+const RUN_REQUEST_TAG_CONVERSATION_ID_INFERENCE: u32 = 1;
+const RUN_REQUEST_TAG_MODEL_PRIMARY: u32 = 3;
+const RUN_REQUEST_TAG_CONVERSATION_ID_AGENT: u32 = 5;
+const RUN_REQUEST_TAG_MODEL_OVERRIDE: u32 = 9;
+const MODEL_TAG_MODEL_ID: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SniffedBidiEnvelope {
+    pub request_id: String,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SniffedClientStart {
+    pub model_id: String,
+    pub conversation_id: Option<String>,
+}
+
+fn unwrap_unary_wire(body: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
+    use crate::cursor::protocol::connect::{decompress_payload, COMPRESSION_FLAG, END_STREAM_FLAG};
+    if body.len() >= 5 {
+        let flags = body[0];
+        let length = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
+        if flags & END_STREAM_FLAG == 0 && length == body.len() - 5 {
+            return match flags {
+                0 => Some(std::borrow::Cow::Borrowed(&body[5..])),
+                COMPRESSION_FLAG => {
+                    decompress_payload(flags, bytes::Bytes::copy_from_slice(&body[5..]))
+                        .ok()
+                        .map(|bytes| std::borrow::Cow::Owned(bytes.to_vec()))
+                }
+                _ => None,
+            };
+        }
+    }
+    Some(std::borrow::Cow::Borrowed(body))
+}
+
+fn non_empty_utf8(bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    (!text.is_empty() && !text.chars().any(char::is_control)).then(|| text.to_owned())
+}
+
+/// Extracts `BidiRequestId.request_id` via raw TLV scan when full prost decode fails.
+pub(crate) fn sniff_bidi_request_id(body: &[u8]) -> Option<String> {
+    let raw = unwrap_unary_wire(body)?;
+    let fields = scan_fields(&raw).ok()?;
+    fields
+        .into_iter()
+        .rev()
+        .find(|field| field.number == BIDI_REQUEST_ID_TAG_ID && field.wire_type == WIRE_LEN)
+        .and_then(|field| non_empty_utf8(field.value))
+}
+
+/// Extracts `(request_id, payload)` from `BidiAppendRequest` via raw TLV scan.
+pub(crate) fn sniff_bidi_append_envelope(body: &[u8]) -> Option<SniffedBidiEnvelope> {
+    let raw = unwrap_unary_wire(body)?;
+    let fields = scan_fields(&raw).ok()?;
+    let request_id = fields
+        .iter()
+        .rev()
+        .find(|field| field.number == BIDI_REQUEST_TAG_REQUEST_ID && field.wire_type == WIRE_LEN)
+        .and_then(|outer| {
+            scan_fields(outer.value)
+                .ok()?
+                .into_iter()
+                .rev()
+                .find_map(|inner| {
+                    (inner.number == BIDI_REQUEST_ID_TAG_ID && inner.wire_type == WIRE_LEN)
+                        .then(|| non_empty_utf8(inner.value))
+                        .flatten()
+                })
+        })?;
+    let binary = fields
+        .iter()
+        .rev()
+        .find(|field| field.number == BIDI_REQUEST_TAG_DATA_BINARY && field.wire_type == WIRE_LEN)
+        .map(|field| field.value)
+        .filter(|value| !value.is_empty());
+    let payload = if let Some(binary) = binary {
+        binary.to_vec()
+    } else {
+        let hex_str = fields
+            .iter()
+            .rev()
+            .find(|field| field.number == BIDI_REQUEST_TAG_DATA_HEX && field.wire_type == WIRE_LEN)
+            .and_then(|field| std::str::from_utf8(field.value).ok())
+            .filter(|value| !value.is_empty())?;
+        hex::decode(hex_str).ok()?
+    };
+    (!payload.is_empty()).then_some(SniffedBidiEnvelope {
+        request_id,
+        payload,
+    })
+}
+
+/// Extracts `model_id` (and optional `conversation_id`) from either `RunInferenceClientMessage`
+/// or `AgentClientMessage` `run_request` (tag 1) without decoding sibling fields.
+pub(crate) fn sniff_client_run_start(payload: &[u8]) -> Option<SniffedClientStart> {
+    let outer = scan_fields(payload).ok()?;
+    let run_request = outer
+        .into_iter()
+        .rev()
+        .find(|field| field.number == CLIENT_TAG_RUN_REQUEST && field.wire_type == WIRE_LEN)?;
+    let inner = scan_fields(run_request.value).ok()?;
+    let extract_model = |tag: u32| -> Option<String> {
+        inner
+            .iter()
+            .rev()
+            .filter(|field| field.number == tag && field.wire_type == WIRE_LEN)
+            .find_map(|field| {
+                scan_fields(field.value)
+                    .ok()?
+                    .into_iter()
+                    .rev()
+                    .find(|sub| sub.number == MODEL_TAG_MODEL_ID && sub.wire_type == WIRE_LEN)
+                    .and_then(|sub| non_empty_utf8(sub.value))
+            })
+    };
+    let model_id = extract_model(RUN_REQUEST_TAG_MODEL_OVERRIDE)
+        .or_else(|| extract_model(RUN_REQUEST_TAG_MODEL_PRIMARY))?;
+    let conversation_id = inner
+        .iter()
+        .rev()
+        .find(|field| {
+            field.number == RUN_REQUEST_TAG_CONVERSATION_ID_AGENT && field.wire_type == WIRE_LEN
+        })
+        .and_then(|field| non_empty_utf8(field.value))
+        .or_else(|| {
+            inner
+                .iter()
+                .rev()
+                .find(|field| {
+                    field.number == RUN_REQUEST_TAG_CONVERSATION_ID_INFERENCE
+                        && field.wire_type == WIRE_LEN
+                })
+                .and_then(|field| non_empty_utf8(field.value))
+        });
+    Some(SniffedClientStart {
+        model_id,
+        conversation_id,
+    })
+}
+
+/// Checks whether a client append payload carries `RunInferenceClientMessage.finish_run` (tag 4).
+pub(crate) fn sniff_client_finish_run(payload: &[u8]) -> bool {
+    scan_fields(payload).ok().is_some_and(|fields| {
+        fields
+            .iter()
+            .any(|field| field.number == CLIENT_TAG_FINISH_RUN && field.wire_type == WIRE_LEN)
+    })
+}
+
 #[cfg(test)]
 pub(crate) fn append_length_delimited_field(buf: &mut Vec<u8>, number: u32, value: &[u8]) {
     buf.extend(encode_length_delimited_field(number, value));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cursor::protocol::{
+        connect,
+        proto::{agent::v1 as agent, aiserver::v1 as ai, inference as pb},
+    };
+    use bytes::Bytes;
+    use prost::Message;
+
+    fn poison_with_wire_conflict(mut encoded: Vec<u8>) -> Vec<u8> {
+        append_length_delimited_field(&mut encoded, 3, b"wire-type-conflict");
+        encoded
+    }
+
+    fn append_varint_field(buf: &mut Vec<u8>, number: u32, value: u64) {
+        let tag = (u64::from(number) << 3) | u64::from(WIRE_VARINT);
+        buf.extend(encode_varint(tag));
+        buf.extend(encode_varint(value));
+    }
+
+    #[test]
+    fn sniff_bidi_request_id_after_prost_decode_failure() {
+        let mut inner = agent::BidiRequestId {
+            request_id: "req-sniff-sse".into(),
+        }
+        .encode_to_vec();
+        append_varint_field(&mut inner, 1, 1);
+        let mut frame = vec![0u8];
+        frame.extend_from_slice(&(inner.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&inner);
+        let poisoned = Bytes::from(frame);
+        assert!(connect::decode_unary::<agent::BidiRequestId>(&poisoned).is_err());
+        assert_eq!(
+            sniff_bidi_request_id(&poisoned).as_deref(),
+            Some("req-sniff-sse")
+        );
+    }
+
+    #[test]
+    fn sniff_bidi_append_envelope_after_prost_decode_failure() {
+        let run = pb::RunInferenceClientMessage {
+            message: Some(pb::run_inference_client_message::Message::RunRequest(
+                pb::RunInferenceRunRequest {
+                    conversation_id: "conv-append".into(),
+                    requested_model: Some(pb::InferenceRequestedModel {
+                        model_id: "composer-2".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )),
+        };
+        let payload = poison_with_wire_conflict(run.encode_to_vec());
+        assert!(pb::RunInferenceClientMessage::decode(payload.as_slice()).is_err());
+        let append = ai::BidiAppendRequest {
+            request_id: Some(ai::BidiRequestId {
+                request_id: "req-append-sniff".into(),
+            }),
+            data_binary: payload.clone(),
+            append_seqno: 0,
+            ..Default::default()
+        };
+        let mut body = append.encode_to_vec();
+        append_varint_field(&mut body, 2, 1);
+        assert!(ai::BidiAppendRequest::decode(body.as_slice()).is_err());
+        let sniffed = sniff_bidi_append_envelope(body.as_slice()).expect("sniffed envelope");
+        assert_eq!(sniffed.request_id, "req-append-sniff");
+        assert_eq!(sniffed.payload, payload);
+    }
+
+    #[test]
+    fn sniff_client_run_start_after_prost_decode_failure() {
+        let message = pb::RunInferenceClientMessage {
+            message: Some(pb::run_inference_client_message::Message::RunRequest(
+                pb::RunInferenceRunRequest {
+                    conversation_id: "conv-run-start".into(),
+                    requested_model: Some(pb::InferenceRequestedModel {
+                        model_id: "gpt-5.6-sol-medium".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )),
+        };
+        let payload = poison_with_wire_conflict(message.encode_to_vec());
+        assert!(pb::RunInferenceClientMessage::decode(payload.as_slice()).is_err());
+        let sniffed = sniff_client_run_start(&payload).expect("run start");
+        assert_eq!(sniffed.model_id, "gpt-5.6-sol-medium");
+        assert_eq!(sniffed.conversation_id.as_deref(), Some("conv-run-start"));
+    }
+
+    #[test]
+    fn sniff_client_finish_run_after_prost_decode_failure() {
+        let message = pb::RunInferenceClientMessage {
+            message: Some(pb::run_inference_client_message::Message::FinishRun(
+                pb::RunInferenceFinishRun {
+                    aborted: false,
+                    turn_completed: Some(true),
+                    ..Default::default()
+                },
+            )),
+        };
+        let payload = poison_with_wire_conflict(message.encode_to_vec());
+        assert!(pb::RunInferenceClientMessage::decode(payload.as_slice()).is_err());
+        assert!(sniff_client_finish_run(&payload));
+    }
 }
